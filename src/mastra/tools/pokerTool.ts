@@ -18,6 +18,8 @@ async function initializeDatabase() {
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
       
+      CREATE INDEX IF NOT EXISTS idx_players_telegram_id ON poker_players(telegram_id);
+      
       CREATE TABLE IF NOT EXISTS poker_games (
         id SERIAL PRIMARY KEY,
         status VARCHAR(50) DEFAULT 'active',
@@ -25,12 +27,15 @@ async function initializeDatabase() {
         ended_at TIMESTAMP
       );
       
+      CREATE INDEX IF NOT EXISTS idx_games_status ON poker_games(status);
+      
       CREATE TABLE IF NOT EXISTS poker_transactions (
         id SERIAL PRIMARY KEY,
         game_id INTEGER REFERENCES poker_games(id),
         player_id INTEGER REFERENCES poker_players(id),
         type VARCHAR(50) NOT NULL,
         amount DECIMAL(10,2) NOT NULL,
+        net_result DECIMAL(10,2),
         payment_method VARCHAR(50),
         chips_1 INTEGER DEFAULT 0,
         chips_5 INTEGER DEFAULT 0,
@@ -38,6 +43,9 @@ async function initializeDatabase() {
         chips_100 INTEGER DEFAULT 0,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
+      
+      CREATE INDEX IF NOT EXISTS idx_transactions_game_id ON poker_transactions(game_id);
+      CREATE INDEX IF NOT EXISTS idx_transactions_player_id ON poker_transactions(player_id);
     `);
   } finally {
     client.release();
@@ -118,6 +126,19 @@ function getPlayStyle(stats: { totalGames: number; totalResult: number; avgResul
   return `${style}\n${description}`;
 }
 
+async function isPlayerAdmin(client: pg.PoolClient, telegramId: string): Promise<boolean> {
+  const result = await client.query(
+    "SELECT is_admin FROM poker_players WHERE telegram_id = $1",
+    [telegramId]
+  );
+  return result.rows.length > 0 && result.rows[0].is_admin === true;
+}
+
+async function getPlayerCount(client: pg.PoolClient): Promise<number> {
+  const result = await client.query("SELECT COUNT(*) as count FROM poker_players");
+  return parseInt(result.rows[0].count) || 0;
+}
+
 export const pokerTool = createTool({
   id: "poker-tool",
   description: `Инструмент для управления покерным столом. Используй для:
@@ -126,7 +147,9 @@ export const pokerTool = createTool({
 - Учёта бай-инов и ребаев
 - Фиксации кэшаута с подсчётом фишек
 - Получения статистики игроков
-- Административных функций`,
+- Административных функций
+
+ВАЖНО: Для админ-действий (start_game, end_game, set_admin) необходимо передать adminTelegramId для проверки прав.`,
 
   inputSchema: z.object({
     action: z.enum([
@@ -143,6 +166,7 @@ export const pokerTool = createTool({
       "active_game_status"
     ]).describe("Действие для выполнения"),
     telegramId: z.string().optional().describe("Telegram ID игрока"),
+    adminTelegramId: z.string().optional().describe("Telegram ID администратора для проверки прав"),
     playerName: z.string().optional().describe("Имя игрока"),
     amount: z.number().optional().describe("Сумма в долларах"),
     paymentMethod: z.enum(["cash", "zelle"]).optional().describe("Способ оплаты: cash или zelle"),
@@ -160,15 +184,18 @@ export const pokerTool = createTool({
 
   execute: async ({ context, mastra }) => {
     const logger = mastra?.getLogger();
-    const { action, telegramId, playerName, amount, paymentMethod, chips1, chips5, chips25, chips100 } = context;
+    const { action, telegramId, adminTelegramId, playerName, amount, paymentMethod, chips1, chips5, chips25, chips100 } = context;
     
     logger?.info(`🎲 [pokerTool] Выполняю действие: ${action}`, context);
     
     const client = await pool.connect();
     try {
+      await client.query('BEGIN');
+      
       switch (action) {
         case "register_player": {
           if (!telegramId || !playerName) {
+            await client.query('ROLLBACK');
             return { success: false, message: "Укажи Telegram ID и имя игрока" };
           }
           
@@ -178,30 +205,52 @@ export const pokerTool = createTool({
           );
           
           if (existing.rows.length > 0) {
+            await client.query('ROLLBACK');
             return { 
               success: false, 
               message: `Игрок ${existing.rows[0].name} уже зарегистрирован!` 
             };
           }
           
+          const playerCount = await getPlayerCount(client);
+          const isFirstPlayer = playerCount === 0;
+          
           await client.query(
-            "INSERT INTO poker_players (telegram_id, name) VALUES ($1, $2)",
-            [telegramId, playerName]
+            "INSERT INTO poker_players (telegram_id, name, is_admin) VALUES ($1, $2, $3)",
+            [telegramId, playerName, isFirstPlayer]
           );
           
-          logger?.info(`✅ [pokerTool] Игрок ${playerName} зарегистрирован`);
+          await client.query('COMMIT');
+          
+          const adminNote = isFirstPlayer ? "\n👑 Ты первый игрок, поэтому автоматически назначен администратором!" : "";
+          
+          logger?.info(`✅ [pokerTool] Игрок ${playerName} зарегистрирован, isAdmin: ${isFirstPlayer}`);
           return { 
             success: true, 
-            message: `🎉 Добро пожаловать, ${playerName}! Ты успешно зарегистрирован в Poker Ботя!` 
+            message: `🎉 Добро пожаловать, ${playerName}! Ты успешно зарегистрирован в Poker Ботя!${adminNote}`,
+            data: { isAdmin: isFirstPlayer }
           };
         }
         
         case "start_game": {
+          const requesterId = adminTelegramId || telegramId;
+          if (!requesterId) {
+            await client.query('ROLLBACK');
+            return { success: false, message: "Укажи свой Telegram ID для проверки прав" };
+          }
+          
+          const isAdmin = await isPlayerAdmin(client, requesterId);
+          if (!isAdmin) {
+            await client.query('ROLLBACK');
+            return { success: false, message: "⛔ Только администратор может начать игру!" };
+          }
+          
           const activeGame = await client.query(
             "SELECT * FROM poker_games WHERE status = 'active'"
           );
           
           if (activeGame.rows.length > 0) {
+            await client.query('ROLLBACK');
             return { 
               success: false, 
               message: "⚠️ Уже есть активная игра! Сначала заверши её." 
@@ -211,6 +260,8 @@ export const pokerTool = createTool({
           const result = await client.query(
             "INSERT INTO poker_games (status) VALUES ('active') RETURNING id, created_at"
           );
+          
+          await client.query('COMMIT');
           
           const gameId = result.rows[0].id;
           const createdAt = new Date(result.rows[0].created_at).toLocaleString('ru-RU');
@@ -224,11 +275,24 @@ export const pokerTool = createTool({
         }
         
         case "end_game": {
+          const requesterId = adminTelegramId || telegramId;
+          if (!requesterId) {
+            await client.query('ROLLBACK');
+            return { success: false, message: "Укажи свой Telegram ID для проверки прав" };
+          }
+          
+          const isAdmin = await isPlayerAdmin(client, requesterId);
+          if (!isAdmin) {
+            await client.query('ROLLBACK');
+            return { success: false, message: "⛔ Только администратор может завершить игру!" };
+          }
+          
           const game = await client.query(
             "SELECT * FROM poker_games WHERE status = 'active'"
           );
           
           if (game.rows.length === 0) {
+            await client.query('ROLLBACK');
             return { success: false, message: "❌ Нет активной игры!" };
           }
           
@@ -237,7 +301,8 @@ export const pokerTool = createTool({
           const transactions = await client.query(`
             SELECT p.name, 
               SUM(CASE WHEN t.type IN ('buyin', 'rebuy') THEN t.amount ELSE 0 END) as total_in,
-              SUM(CASE WHEN t.type = 'cashout' THEN t.amount ELSE 0 END) as total_out
+              SUM(CASE WHEN t.type = 'cashout' THEN t.amount ELSE 0 END) as total_out,
+              SUM(CASE WHEN t.type = 'cashout' THEN t.net_result ELSE 0 END) as net_result
             FROM poker_transactions t
             JOIN poker_players p ON t.player_id = p.id
             WHERE t.game_id = $1
@@ -251,10 +316,9 @@ export const pokerTool = createTool({
           
           for (const row of transactions.rows) {
             const totalIn = parseFloat(row.total_in) || 0;
-            const totalOut = parseFloat(row.total_out) || 0;
-            const result = totalOut - totalIn;
+            const netResult = parseFloat(row.net_result) || 0;
             totalBank += totalIn;
-            results.push({ name: row.name, result });
+            results.push({ name: row.name, result: netResult });
           }
           
           results.sort((a, b) => b.result - a.result);
@@ -272,6 +336,8 @@ export const pokerTool = createTool({
             [gameId]
           );
           
+          await client.query('COMMIT');
+          
           logger?.info(`✅ [pokerTool] Игра #${gameId} завершена`);
           return { success: true, message: report, data: { gameId, results } };
         }
@@ -279,6 +345,7 @@ export const pokerTool = createTool({
         case "add_buyin":
         case "add_rebuy": {
           if (!telegramId || !amount) {
+            await client.query('ROLLBACK');
             return { success: false, message: "Укажи Telegram ID и сумму" };
           }
           
@@ -288,7 +355,8 @@ export const pokerTool = createTool({
           );
           
           if (player.rows.length === 0) {
-            return { success: false, message: "❌ Игрок не зарегистрирован!" };
+            await client.query('ROLLBACK');
+            return { success: false, message: "❌ Игрок не зарегистрирован! Сначала зарегистрируйся." };
           }
           
           const activeGame = await client.query(
@@ -296,7 +364,8 @@ export const pokerTool = createTool({
           );
           
           if (activeGame.rows.length === 0) {
-            return { success: false, message: "❌ Нет активной игры!" };
+            await client.query('ROLLBACK');
+            return { success: false, message: "❌ Нет активной игры! Попроси админа начать игру." };
           }
           
           const type = action === "add_buyin" ? "buyin" : "rebuy";
@@ -308,16 +377,20 @@ export const pokerTool = createTool({
             [activeGame.rows[0].id, player.rows[0].id, type, amount, method]
           );
           
+          await client.query('COMMIT');
+          
           const actionName = type === "buyin" ? "Бай-ин" : "Ребай";
           logger?.info(`✅ [pokerTool] ${actionName} $${amount} для ${player.rows[0].name}`);
           return { 
             success: true, 
-            message: `💵 ${actionName} $${amount} (${method}) для ${player.rows[0].name} записан! Удачи за столом! 🍀` 
+            message: `💵 ${actionName} $${amount} (${method}) для ${player.rows[0].name} записан! Удачи за столом! 🍀`,
+            data: { type, amount, paymentMethod: method, playerName: player.rows[0].name }
           };
         }
         
         case "cashout": {
           if (!telegramId) {
+            await client.query('ROLLBACK');
             return { success: false, message: "Укажи Telegram ID" };
           }
           
@@ -327,6 +400,7 @@ export const pokerTool = createTool({
           );
           
           if (player.rows.length === 0) {
+            await client.query('ROLLBACK');
             return { success: false, message: "❌ Игрок не зарегистрирован!" };
           }
           
@@ -335,6 +409,7 @@ export const pokerTool = createTool({
           );
           
           if (activeGame.rows.length === 0) {
+            await client.query('ROLLBACK');
             return { success: false, message: "❌ Нет активной игры!" };
           }
           
@@ -351,17 +426,19 @@ export const pokerTool = createTool({
           `, [activeGame.rows[0].id, player.rows[0].id]);
           
           const totalIn = parseFloat(buyins.rows[0].total) || 0;
-          const result = totalChips - totalIn;
+          const netResult = totalChips - totalIn;
           
           await client.query(
-            `INSERT INTO poker_transactions (game_id, player_id, type, amount, chips_1, chips_5, chips_25, chips_100)
-             VALUES ($1, $2, 'cashout', $3, $4, $5, $6, $7)`,
-            [activeGame.rows[0].id, player.rows[0].id, totalChips, c1, c5, c25, c100]
+            `INSERT INTO poker_transactions (game_id, player_id, type, amount, net_result, chips_1, chips_5, chips_25, chips_100)
+             VALUES ($1, $2, 'cashout', $3, $4, $5, $6, $7, $8)`,
+            [activeGame.rows[0].id, player.rows[0].id, totalChips, netResult, c1, c5, c25, c100]
           );
           
-          const joke = getRandomJoke(result);
-          const sign = result >= 0 ? "+" : "";
-          const resultEmoji = result >= 0 ? "📈" : "📉";
+          await client.query('COMMIT');
+          
+          const joke = getRandomJoke(netResult);
+          const sign = netResult >= 0 ? "+" : "";
+          const resultEmoji = netResult >= 0 ? "📈" : "📉";
           
           let message = `🎰 КЭШАУТ: ${player.rows[0].name}\n`;
           message += `━━━━━━━━━━━━━━━━━━━━━\n`;
@@ -372,15 +449,20 @@ export const pokerTool = createTool({
           message += `  • $100 × ${c100} = $${c100 * 100}\n`;
           message += `━━━━━━━━━━━━━━━━━━━━━\n`;
           message += `📥 Вложено: $${totalIn}\n`;
-          message += `${resultEmoji} Результат: ${sign}$${result.toFixed(2)}\n\n`;
+          message += `${resultEmoji} Результат: ${sign}$${netResult.toFixed(2)}\n\n`;
           message += joke;
           
-          logger?.info(`✅ [pokerTool] Кэшаут $${totalChips} для ${player.rows[0].name}, результат: ${sign}$${result}`);
-          return { success: true, message, data: { totalChips, totalIn, result } };
+          logger?.info(`✅ [pokerTool] Кэшаут $${totalChips} для ${player.rows[0].name}, результат: ${sign}$${netResult}`);
+          return { 
+            success: true, 
+            message, 
+            data: { totalChips, totalIn, netResult, playerName: player.rows[0].name } 
+          };
         }
         
         case "player_stats": {
           if (!telegramId) {
+            await client.query('ROLLBACK');
             return { success: false, message: "Укажи Telegram ID" };
           }
           
@@ -390,14 +472,14 @@ export const pokerTool = createTool({
           );
           
           if (player.rows.length === 0) {
+            await client.query('ROLLBACK');
             return { success: false, message: "❌ Игрок не зарегистрирован!" };
           }
           
           const stats = await client.query(`
             SELECT 
               COUNT(DISTINCT t.game_id) as total_games,
-              COALESCE(SUM(CASE WHEN t.type IN ('buyin', 'rebuy') THEN t.amount ELSE 0 END), 0) as total_in,
-              COALESCE(SUM(CASE WHEN t.type = 'cashout' THEN t.amount ELSE 0 END), 0) as total_out
+              COALESCE(SUM(CASE WHEN t.type = 'cashout' THEN t.net_result ELSE 0 END), 0) as total_result
             FROM poker_transactions t
             WHERE t.player_id = $1
           `, [player.rows[0].id]);
@@ -405,36 +487,29 @@ export const pokerTool = createTool({
           const gameResults = await client.query(`
             SELECT 
               t.game_id,
-              SUM(CASE WHEN t.type IN ('buyin', 'rebuy') THEN t.amount ELSE 0 END) as game_in,
-              SUM(CASE WHEN t.type = 'cashout' THEN t.amount ELSE 0 END) as game_out
+              SUM(CASE WHEN t.type = 'cashout' THEN t.net_result ELSE 0 END) as game_result
             FROM poker_transactions t
-            WHERE t.player_id = $1
+            WHERE t.player_id = $1 AND t.type = 'cashout'
             GROUP BY t.game_id
           `, [player.rows[0].id]);
           
-          const results = gameResults.rows.map(r => {
-            const gameIn = parseFloat(r.game_in) || 0;
-            const gameOut = parseFloat(r.game_out) || 0;
-            return gameOut - gameIn;
-          }).filter(r => !isNaN(r));
+          const results = gameResults.rows.map(r => parseFloat(r.game_result) || 0);
           
           const totalGames = parseInt(stats.rows[0].total_games) || 0;
-          const totalIn = parseFloat(stats.rows[0].total_in) || 0;
-          const totalOut = parseFloat(stats.rows[0].total_out) || 0;
-          const totalResult = totalOut - totalIn;
-          const avgResult = totalGames > 0 ? totalResult / totalGames : 0;
+          const totalResult = parseFloat(stats.rows[0].total_result) || 0;
+          const avgResult = results.length > 0 ? totalResult / results.length : 0;
           
           const bestResult = results.length > 0 ? Math.max(...results) : 0;
           const worstResult = results.length > 0 ? Math.min(...results) : 0;
           
-          const playStyle = getPlayStyle({ totalGames, totalResult, avgResult });
+          const playStyle = getPlayStyle({ totalGames: results.length, totalResult, avgResult });
           
           const sign = totalResult >= 0 ? "+" : "";
           const resultEmoji = totalResult >= 0 ? "📈" : "📉";
           
           let message = `📊 СТАТИСТИКА: ${player.rows[0].name}\n`;
           message += `━━━━━━━━━━━━━━━━━━━━━\n`;
-          message += `🎲 Игр сыграно: ${totalGames}\n`;
+          message += `🎲 Игр сыграно: ${results.length}\n`;
           message += `${resultEmoji} Общий результат: ${sign}$${totalResult.toFixed(2)}\n`;
           message += `📉 Средний результат: ${avgResult >= 0 ? "+" : ""}$${avgResult.toFixed(2)}\n`;
           message += `🏆 Лучший результат: +$${bestResult.toFixed(2)}\n`;
@@ -442,8 +517,14 @@ export const pokerTool = createTool({
           message += `━━━━━━━━━━━━━━━━━━━━━\n`;
           message += `🎭 СТИЛЬ ИГРЫ:\n${playStyle}`;
           
+          await client.query('COMMIT');
+          
           logger?.info(`✅ [pokerTool] Статистика для ${player.rows[0].name}`);
-          return { success: true, message, data: { totalGames, totalResult, avgResult, bestResult, worstResult } };
+          return { 
+            success: true, 
+            message, 
+            data: { totalGames: results.length, totalResult, avgResult, bestResult, worstResult } 
+          };
         }
         
         case "game_report": {
@@ -452,6 +533,7 @@ export const pokerTool = createTool({
           );
           
           if (lastGame.rows.length === 0) {
+            await client.query('ROLLBACK');
             return { success: false, message: "❌ Игр пока не было!" };
           }
           
@@ -481,13 +563,38 @@ export const pokerTool = createTool({
             message += `\n`;
           }
           
+          await client.query('COMMIT');
+          
           logger?.info(`✅ [pokerTool] Отчёт по игре #${gameId}`);
-          return { success: true, message };
+          return { success: true, message, data: { gameId, gameStatus } };
         }
         
         case "set_admin": {
+          const requesterId = adminTelegramId;
+          if (!requesterId) {
+            await client.query('ROLLBACK');
+            return { success: false, message: "Укажи свой Telegram ID (adminTelegramId) для проверки прав" };
+          }
+          
           if (!telegramId) {
-            return { success: false, message: "Укажи Telegram ID" };
+            await client.query('ROLLBACK');
+            return { success: false, message: "Укажи Telegram ID нового администратора" };
+          }
+          
+          const isAdmin = await isPlayerAdmin(client, requesterId);
+          if (!isAdmin) {
+            await client.query('ROLLBACK');
+            return { success: false, message: "⛔ Только администратор может назначать других администраторов!" };
+          }
+          
+          const targetPlayer = await client.query(
+            "SELECT * FROM poker_players WHERE telegram_id = $1",
+            [telegramId]
+          );
+          
+          if (targetPlayer.rows.length === 0) {
+            await client.query('ROLLBACK');
+            return { success: false, message: "❌ Игрок не найден!" };
           }
           
           await client.query(
@@ -495,14 +602,22 @@ export const pokerTool = createTool({
             [telegramId]
           );
           
+          await client.query('COMMIT');
+          
           logger?.info(`✅ [pokerTool] Установлен админ: ${telegramId}`);
-          return { success: true, message: "👑 Права администратора выданы!" };
+          return { 
+            success: true, 
+            message: `👑 Игрок ${targetPlayer.rows[0].name} теперь администратор!`,
+            data: { newAdminName: targetPlayer.rows[0].name }
+          };
         }
         
         case "list_players": {
           const players = await client.query(
             "SELECT name, telegram_id, is_admin, created_at FROM poker_players ORDER BY name"
           );
+          
+          await client.query('COMMIT');
           
           if (players.rows.length === 0) {
             return { success: true, message: "📋 Пока нет зарегистрированных игроков." };
@@ -515,13 +630,15 @@ export const pokerTool = createTool({
           }
           
           logger?.info(`✅ [pokerTool] Список игроков`);
-          return { success: true, message, data: players.rows };
+          return { success: true, message, data: { count: players.rows.length } };
         }
         
         case "active_game_status": {
           const activeGame = await client.query(
             "SELECT * FROM poker_games WHERE status = 'active'"
           );
+          
+          await client.query('COMMIT');
           
           if (activeGame.rows.length === 0) {
             return { success: true, message: "🔴 Сейчас нет активной игры.\n\nЧтобы начать новую игру, админ должен дать команду." };
@@ -555,13 +672,15 @@ export const pokerTool = createTool({
           message += `💰 Общий банк: $${totalBank.toFixed(2)}`;
           
           logger?.info(`✅ [pokerTool] Статус активной игры #${gameId}`);
-          return { success: true, message, data: { gameId, players: players.rows, totalBank } };
+          return { success: true, message, data: { gameId, playerCount: players.rows.length, totalBank } };
         }
         
         default:
+          await client.query('ROLLBACK');
           return { success: false, message: "❌ Неизвестное действие" };
       }
     } catch (error) {
+      await client.query('ROLLBACK');
       logger?.error(`❌ [pokerTool] Ошибка:`, error);
       return { 
         success: false, 
