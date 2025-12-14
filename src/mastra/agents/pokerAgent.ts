@@ -71,7 +71,7 @@ export const pokerAgent = new Agent({
 
 Пример: "кэшаут $1 x 10, $5 x 6, $25 x 2, $100 x 1" → chips1=10, chips5=6, chips25=2, chips100=1`,
 
-  model: openai("gpt-4o"),
+  model: openai("gpt-4o-mini"),
 
   tools: { pokerTool },
 
