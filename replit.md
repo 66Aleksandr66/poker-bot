@@ -2,77 +2,56 @@
 
 ## Overview
 
-This is a Mastra-based AI agent automation platform. The project implements **Poker Ботя** — a Russian-language Telegram bot for tracking poker cash games with buy-ins, rebuys, cashouts, player statistics, and fun comments. The system uses Mastra's workflow engine with Inngest for durable execution.
+**Poker Ботя** — Russian-language Telegram bot for tracking poker cash games. Uses strict command structure (no AI required).
 
 ## User Preferences
 
 - Bot name: **Poker Ботя**
 - Language: **Russian only**
-- No optional features — only core functionality
-- Preferred communication style: Simple, everyday language.
+- No AI — simple command-based interface
+- Fun phrases at game end based on results
+
+## Bot Commands
+
+| Command | Description |
+|---------|-------------|
+| `/reg Имя` | Register player |
+| `/start_game` | Start new game (admin only) |
+| `/end_game` | End game and show results (admin only) |
+| `/buyin сумма [способ]` | Buy-in (способ: cash/zelle) |
+| `/rebuy сумма [способ]` | Rebuy |
+| `/cashout $1 $5 $25 $100` | Cashout with chip counts |
+| `/stats` | Player statistics |
+| `/status` | Current game status |
+| `/players` | List all players |
+| `/help` | Show commands |
 
 ## System Architecture
 
-### Core Framework
-- **Mastra Framework**: TypeScript-based AI agent framework providing agents, tools, and workflows
-- **Inngest Integration**: Durable workflow execution layer that ensures reliability and resumability
-- **Event-Driven Architecture**: Webhooks and cron triggers for automation entry points
+### Files
+- `src/mastra/handlers/pokerCommandHandler.ts` — Command parser and database operations
+- `src/triggers/telegramTriggers.ts` — Telegram webhook handler
+- `src/mastra/index.ts` — Mastra server configuration
 
-### Agent System
-- Agents use LLMs (OpenAI/OpenRouter) with tools to solve tasks
-- Memory system with conversation history, semantic recall, and working memory
-- Agents can be composed into networks for complex multi-agent coordination
+### Database Tables
+- `poker_players` — Player registry (telegram_id, name, is_admin)
+- `poker_games` — Game sessions (status: active/ended)
+- `poker_transactions` — Buy-ins, rebuys, cashouts with chip counts
 
-### Workflow Engine
-- Graph-based workflow orchestration with `createWorkflow` and `createStep`
-- Supports branching, parallel execution, and human-in-the-loop patterns
-- Suspend/resume capabilities for workflows requiring external input
-- Step-level retries for handling transient failures
+### Features
+- First registered player becomes admin automatically
+- Admin-only game start/end
+- Payment method tracking (cash/zelle)
+- Chip counting for cashout ($1, $5, $25, $100)
+- Fun phrases based on win/loss amount
 
-### Trigger System
-- **Telegram Triggers** (`src/triggers/telegramTriggers.ts`): Handle incoming Telegram bot messages
-- **Slack Triggers** (`src/triggers/slackTriggers.ts`): Process Slack events
-- **Cron Triggers** (`src/triggers/cronTriggers.ts`): Time-based scheduled automations
-- **Webhook Triggers** (`src/triggers/exampleConnectorTrigger.ts`): Generic webhook handlers for third-party services
+## Environment Variables Required
 
-### Data Flow
-1. External event (webhook/cron) → Trigger handler
-2. Trigger validates payload → Creates workflow run
-3. Inngest orchestrates workflow execution step-by-step
-4. Each step result is memoized for durability
-5. Workflow can suspend for human input and resume later
-
-### Key Design Decisions
-- **Inngest for Durability**: All workflows run through Inngest to ensure execution survives failures
-- **Mastra Playground UI**: Requires `generateLegacy` method for backwards compatibility
-- **TypeScript ES Modules**: Uses ES2022 modules with bundler resolution
-- **Zod Validation**: All schemas use Zod for runtime type safety
-
-## External Dependencies
-
-### AI/LLM Providers
-- **OpenAI** (`@ai-sdk/openai`): Primary LLM provider
-- **OpenRouter** (`@openrouter/ai-sdk-provider`): Alternative model routing
-
-### Database & Storage
-- **PostgreSQL** (`@mastra/pg`, `pg`): Primary persistent storage with pgvector for semantic search
-- **LibSQL** (`@mastra/libsql`): Alternative lightweight storage option
-
-### Workflow Orchestration
-- **Inngest** (`inngest`, `@mastra/inngest`, `@inngest/realtime`): Durable workflow execution and real-time updates
-
-### Messaging Integrations
-- **Telegram**: Bot integration via webhook triggers (TELEGRAM_BOT_TOKEN required)
-- **Slack** (`@slack/web-api`): Slack bot integration
-
-### Search & Retrieval
-- **Exa** (`exa-js`): Web search capabilities for agents
-
-### MCP Integration
-- **MCP Server** (`@mastra/mcp`): Model Context Protocol for tool/resource sharing
-
-### Environment Variables Required
-- `OPENAI_API_KEY`: OpenAI API access
 - `DATABASE_URL`: PostgreSQL connection string
-- `TELEGRAM_BOT_TOKEN`: Telegram bot authentication
-- `INNGEST_SIGNING_KEY`: Inngest authentication (production)
+- `TELEGRAM_BOT_TOKEN`: Telegram bot token
+
+## Deployment
+
+1. Set TELEGRAM_BOT_TOKEN secret
+2. Deploy the app
+3. Set webhook: `https://your-app.replit.app/webhooks/telegram/action`

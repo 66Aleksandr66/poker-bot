@@ -45,6 +45,14 @@ async function initializeDatabase() {
       CREATE INDEX IF NOT EXISTS idx_transactions_game_id ON poker_transactions(game_id);
       CREATE INDEX IF NOT EXISTS idx_transactions_player_id ON poker_transactions(player_id);
     `);
+    
+    await client.query(`
+      ALTER TABLE poker_transactions ADD COLUMN IF NOT EXISTS net_result DECIMAL(10,2);
+      ALTER TABLE poker_transactions ADD COLUMN IF NOT EXISTS chips_1 INTEGER DEFAULT 0;
+      ALTER TABLE poker_transactions ADD COLUMN IF NOT EXISTS chips_5 INTEGER DEFAULT 0;
+      ALTER TABLE poker_transactions ADD COLUMN IF NOT EXISTS chips_25 INTEGER DEFAULT 0;
+      ALTER TABLE poker_transactions ADD COLUMN IF NOT EXISTS chips_100 INTEGER DEFAULT 0;
+    `);
   } finally {
     client.release();
   }
