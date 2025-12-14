@@ -10,9 +10,7 @@ import { z } from "zod";
 import { sharedPostgresStorage } from "./storage";
 import { inngest, inngestServe } from "./inngest";
 
-import { registerTelegramTrigger } from "../triggers/telegramTriggers";
-import { pokerAgent } from "./agents/pokerAgent";
-import { pokerWorkflow } from "./workflows/pokerWorkflow";
+import { registerTelegramCommandHandler } from "../triggers/telegramTriggers";
 
 class ProductionPinoLogger extends MastraLogger {
   protected logger: pino.Logger;
@@ -57,8 +55,8 @@ class ProductionPinoLogger extends MastraLogger {
 
 export const mastra = new Mastra({
   storage: sharedPostgresStorage,
-  workflows: { pokerWorkflow },
-  agents: { pokerAgent },
+  workflows: {},
+  agents: {},
   mcpServers: {
     allTools: new MCPServer({
       name: "allTools",
@@ -111,28 +109,7 @@ export const mastra = new Mastra({
         createHandler: async ({ mastra }) => inngestServe({ mastra, inngest }),
       },
 
-      ...registerTelegramTrigger({
-        triggerType: "telegram/message",
-        handler: async (mastra, triggerInfo) => {
-          const logger = mastra.getLogger();
-          logger?.info("🎲 [Telegram Trigger] Получено сообщение", triggerInfo);
-
-          const run = await pokerWorkflow.createRunAsync();
-          
-          await inngest.send({
-            name: `workflow.${pokerWorkflow.id}`,
-            data: {
-              runId: run?.runId,
-              inputData: {
-                message: triggerInfo.params.message || "",
-                telegramId: String(triggerInfo.payload.message?.from?.id || ""),
-                userName: triggerInfo.params.userName || "Unknown",
-                chatId: String(triggerInfo.payload.message?.chat?.id || ""),
-              },
-            },
-          });
-        },
-      }),
+      ...registerTelegramCommandHandler(),
     ],
   },
   logger:
@@ -146,15 +123,3 @@ export const mastra = new Mastra({
           level: "info",
         }),
 });
-
-if (Object.keys(mastra.getWorkflows()).length > 1) {
-  throw new Error(
-    "More than 1 workflows found. Currently, more than 1 workflows are not supported in the UI, since doing so will cause app state to be inconsistent.",
-  );
-}
-
-if (Object.keys(mastra.getAgents()).length > 1) {
-  throw new Error(
-    "More than 1 agents found. Currently, more than 1 agents are not supported in the UI, since doing so will cause app state to be inconsistent.",
-  );
-}
