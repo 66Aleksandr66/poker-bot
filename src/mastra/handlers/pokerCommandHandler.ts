@@ -514,6 +514,14 @@ export async function handleCallbackQuery(telegramId: string, callbackData: stri
         GROUP BY p.id, p.name
       `, [activeGame.id]);
       
+      const paymentTotals = await client.query(`
+        SELECT 
+          COALESCE(SUM(CASE WHEN payment_method = 'cash' THEN amount ELSE 0 END), 0) as total_cash,
+          COALESCE(SUM(CASE WHEN payment_method = 'zelle' THEN amount ELSE 0 END), 0) as total_zelle
+        FROM poker_transactions
+        WHERE game_id = $1 AND type IN ('buyin', 'rebuy')
+      `, [activeGame.id]);
+      
       await client.query('COMMIT');
       
       let totalBank = 0;
@@ -532,7 +540,12 @@ export async function handleCallbackQuery(telegramId: string, callbackData: stri
         message += "_Пока никто не зашёл в игру_\n";
       }
       
-      message += `━━━━━━━━━━━━━━━━━━━━━\n💰 В банке: *$${totalBank.toFixed(0)}*`;
+      const totalCash = parseFloat(paymentTotals.rows[0]?.total_cash) || 0;
+      const totalZelle = parseFloat(paymentTotals.rows[0]?.total_zelle) || 0;
+      
+      message += `━━━━━━━━━━━━━━━━━━━━━\n`;
+      message += `💰 В банке: *$${totalBank.toFixed(0)}*\n`;
+      message += `💵 Cash: $${totalCash.toFixed(0)} | 💳 Zelle: $${totalZelle.toFixed(0)}`;
       
       return {
         text: message,
