@@ -202,6 +202,7 @@ function getMainMenuKeyboard(isAdmin: boolean, isInGame: boolean, hasActiveGame:
     } else {
       keyboard.push([{ text: "🏁 Завершить игру", callback_data: "end_game" }]);
     }
+    keyboard.push([{ text: "🗑️ Обнулить статистику", callback_data: "reset_stats_confirm" }]);
   }
   
   keyboard.push([
@@ -665,6 +666,60 @@ export async function handleCallbackQuery(telegramId: string, callbackData: stri
       return {
         text: message,
         reply_markup: getMainMenuKeyboard(isAdmin, isInGame && !hasCashedOut, !!activeGame)
+      };
+    }
+    
+    if (callbackData === "reset_stats_confirm") {
+      if (!isAdmin) {
+        await client.query('COMMIT');
+        return { text: "⛔ Только админ может обнулить статистику!" };
+      }
+      
+      if (activeGame) {
+        await client.query('COMMIT');
+        return { 
+          text: "⚠️ Нельзя обнулить статистику во время активной игры!\n\nСначала заверши игру.",
+          reply_markup: getMainMenuKeyboard(isAdmin, isInGame && !hasCashedOut, !!activeGame)
+        };
+      }
+      
+      await client.query('COMMIT');
+      return {
+        text: "⚠️ *ВНИМАНИЕ!*\n\n🗑️ Это удалит ВСЮ историю игр и статистику ВСЕХ игроков!\n\nТы уверен?",
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: "✅ Да, обнулить всё", callback_data: "reset_stats_yes" },
+              { text: "❌ Отмена", callback_data: "cancel" }
+            ]
+          ]
+        }
+      };
+    }
+    
+    if (callbackData === "reset_stats_yes") {
+      if (!isAdmin) {
+        await client.query('COMMIT');
+        return { text: "⛔ Только админ может обнулить статистику!" };
+      }
+      
+      if (activeGame) {
+        await client.query('COMMIT');
+        return { 
+          text: "⚠️ Нельзя обнулить статистику во время активной игры!",
+          reply_markup: getMainMenuKeyboard(isAdmin, isInGame && !hasCashedOut, !!activeGame)
+        };
+      }
+      
+      await client.query("DELETE FROM poker_transactions");
+      await client.query("DELETE FROM poker_games");
+      await client.query("DELETE FROM poker_pending_actions");
+      
+      await client.query('COMMIT');
+      
+      return {
+        text: "🗑️ *СТАТИСТИКА ОБНУЛЕНА!*\n\nВся история игр и транзакций удалена.\nИгроки сохранены.",
+        reply_markup: getMainMenuKeyboard(isAdmin, false, false)
       };
     }
     

@@ -30,6 +30,7 @@
 | 👥 Игроки | List all players |
 | 🎲 Начать игру | Start new game (admin only) |
 | 🏁 Завершить игру | End game (admin only) |
+| 🗑️ Обнулить статистику | Reset all stats (admin only, with confirmation) |
 
 ### Payment Selection
 After "Join" or "Rebuy":
