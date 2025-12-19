@@ -714,11 +714,12 @@ export async function handleCallbackQuery(telegramId: string, callbackData: stri
       await client.query("DELETE FROM poker_transactions");
       await client.query("DELETE FROM poker_games");
       await client.query("DELETE FROM poker_pending_actions");
+      await client.query("ALTER SEQUENCE poker_games_id_seq RESTART WITH 1");
       
       await client.query('COMMIT');
       
       return {
-        text: "🗑️ *СТАТИСТИКА ОБНУЛЕНА!*\n\nВся история игр и транзакций удалена.\nИгроки сохранены.",
+        text: "🗑️ *СТАТИСТИКА ОБНУЛЕНА!*\n\nВся история игр и транзакций удалена.\nСчётчик игр сброшен.\nИгроки сохранены.",
         reply_markup: getMainMenuKeyboard(isAdmin, false, false)
       };
     }
