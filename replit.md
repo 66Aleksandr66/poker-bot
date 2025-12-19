@@ -26,10 +26,12 @@
 | 🎮 Вступить в игру ($20) | Join game (shows payment selection) |
 | 💰 Rebuy +$20 | Buy more chips (shows payment selection) |
 | 🎰 Кэшаут | Enter total chips remaining |
-| 📊 Статус игры | Current game status |
+| 📊 Статус игры | Current game status (shows cash/zelle per player) |
 | 📈 Моя статистика | Player statistics |
 | 👥 Игроки | List all players |
 | 🎲 Начать игру | Start new game (admin only) |
+| ➕ Добавить гостя | Add guest player without Telegram (admin only) |
+| 🎰 Кэшаут гостя | Cashout guest player (admin only) |
 | 🏁 Завершить игру | End game (admin only) |
 | 🗑️ Обнулить статистику | Reset all stats (admin only, with confirmation) |
 
