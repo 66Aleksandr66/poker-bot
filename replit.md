@@ -2,47 +2,68 @@
 
 ## Overview
 
-**Poker Ботя** — Russian-language Telegram bot for tracking poker cash games. Uses strict command structure (no AI required).
+**Poker Ботя** — Russian-language Telegram bot for tracking poker cash games. Uses button-based interface (no AI required).
 
 ## User Preferences
 
 - Bot name: **Poker Ботя**
 - Language: **Russian only**
-- No AI — simple command-based interface
+- No AI — simple button-based interface
 - Fun phrases at game end based on results
+- Fixed amounts: $20 buy-in/rebuy (200 chips = $20)
 
-## Bot Commands
+## Bot Interface
 
-| Command | Description |
-|---------|-------------|
-| `/reg Имя` | Register player |
-| `/start_game` | Start new game (admin only) |
-| `/end_game` | End game and show results (admin only) |
-| `/buyin сумма [способ]` | Buy-in (способ: cash/zelle) |
-| `/rebuy сумма [способ]` | Rebuy |
-| `/cashout $1 $5 $25 $100` | Cashout with chip counts |
-| `/stats` | Player statistics |
-| `/status` | Current game status |
-| `/players` | List all players |
-| `/help` | Show commands |
+### Button-Based Flow
+1. `/reg Имя` — Register player (text command)
+2. `/menu` or `/start` — Show main menu with buttons
+3. All other actions via inline buttons
+
+### Main Menu Buttons
+| Button | Description |
+|--------|-------------|
+| 🎮 Вступить в игру ($20) | Join game (shows payment selection) |
+| 💰 Rebuy +$20 | Buy more chips (shows payment selection) |
+| 🎰 Кэшаут | Enter total chips remaining |
+| 📊 Статус игры | Current game status |
+| 📈 Моя статистика | Player statistics |
+| 👥 Игроки | List all players |
+| 🎲 Начать игру | Start new game (admin only) |
+| 🏁 Завершить игру | End game (admin only) |
+
+### Payment Selection
+After "Join" or "Rebuy":
+- 💵 Cash
+- 💳 Zelle
+
+### Cashout Flow
+1. Player clicks "Кэшаут"
+2. Bot asks for total chip count
+3. Player sends number (e.g., 250)
+4. Bot calculates result (200 chips = $20)
 
 ## System Architecture
 
 ### Files
-- `src/mastra/handlers/pokerCommandHandler.ts` — Command parser and database operations
-- `src/triggers/telegramTriggers.ts` — Telegram webhook handler
+- `src/mastra/handlers/pokerCommandHandler.ts` — Command/callback handler and database operations
+- `src/triggers/telegramTriggers.ts` — Telegram webhook handler (messages + callbacks)
 - `src/mastra/index.ts` — Mastra server configuration
 
 ### Database Tables
 - `poker_players` — Player registry (telegram_id, name, is_admin)
 - `poker_games` — Game sessions (status: active/ended)
-- `poker_transactions` — Buy-ins, rebuys, cashouts with chip counts
+- `poker_transactions` — Buy-ins, rebuys, cashouts with chip totals
+- `poker_pending_actions` — Tracks pending user inputs (e.g., awaiting chip count)
+
+### Key Constants
+- `BUYIN_AMOUNT = 20` — Fixed $20 per buy-in/rebuy
+- `CHIPS_PER_BUYIN = 200` — 200 chips = $20
 
 ### Features
 - First registered player becomes admin automatically
 - Admin-only game start/end
-- Payment method tracking (cash/zelle)
-- Chip counting for cashout ($1, $5, $25, $100)
+- Payment method tracking (cash/zelle) via buttons
+- Simple chip counting (total chips, not denominations)
 - Fun phrases based on win/loss amount
 
 ## Environment Variables Required

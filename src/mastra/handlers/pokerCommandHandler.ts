@@ -4,6 +4,9 @@ const pool = new pg.Pool({
   connectionString: process.env.DATABASE_URL,
 });
 
+const BUYIN_AMOUNT = 20;
+const CHIPS_PER_BUYIN = 200;
+
 async function initializeDatabase() {
   const client = await pool.connect();
   try {
@@ -35,23 +38,24 @@ async function initializeDatabase() {
         amount DECIMAL(10,2) NOT NULL,
         net_result DECIMAL(10,2),
         payment_method VARCHAR(50),
-        chips_1 INTEGER DEFAULT 0,
-        chips_5 INTEGER DEFAULT 0,
-        chips_25 INTEGER DEFAULT 0,
-        chips_100 INTEGER DEFAULT 0,
+        chips_total INTEGER DEFAULT 0,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
       
       CREATE INDEX IF NOT EXISTS idx_transactions_game_id ON poker_transactions(game_id);
       CREATE INDEX IF NOT EXISTS idx_transactions_player_id ON poker_transactions(player_id);
+
+      CREATE TABLE IF NOT EXISTS poker_pending_actions (
+        id SERIAL PRIMARY KEY,
+        telegram_id VARCHAR(255) NOT NULL,
+        action_type VARCHAR(50) NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
     `);
     
     await client.query(`
       ALTER TABLE poker_transactions ADD COLUMN IF NOT EXISTS net_result DECIMAL(10,2);
-      ALTER TABLE poker_transactions ADD COLUMN IF NOT EXISTS chips_1 INTEGER DEFAULT 0;
-      ALTER TABLE poker_transactions ADD COLUMN IF NOT EXISTS chips_5 INTEGER DEFAULT 0;
-      ALTER TABLE poker_transactions ADD COLUMN IF NOT EXISTS chips_25 INTEGER DEFAULT 0;
-      ALTER TABLE poker_transactions ADD COLUMN IF NOT EXISTS chips_100 INTEGER DEFAULT 0;
+      ALTER TABLE poker_transactions ADD COLUMN IF NOT EXISTS chips_total INTEGER DEFAULT 0;
     `);
   } finally {
     client.release();
@@ -92,14 +96,6 @@ const phrasesBigLoss = [
   "Зато атмосфера за столом была отличная — благодаря тебе",
 ];
 
-const phrasesSpecial = [
-  "Играл красиво. Результат — это уже детали",
-  "Сегодня ты был опасен… в теории",
-  "Стратегия была. Карты — нет",
-  "Ты заставил стол нервничать. Иногда даже себя",
-  "Не каждый день заканчивается в плюс — но каждый день даёт историю",
-];
-
 function getRandomPhrase(result: number): string {
   let phrases: string[];
   if (result >= 100) {
@@ -114,36 +110,12 @@ function getRandomPhrase(result: number): string {
   return phrases[Math.floor(Math.random() * phrases.length)];
 }
 
-const HELP_MESSAGE = `🃏 *POKER БОТЯ* — Команды:
-
-📝 *РЕГИСТРАЦИЯ:*
-\`/reg Имя\` — зарегистрироваться
-Пример: \`/reg Андрей\`
-
-🎮 *ИГРА (только админ):*
-\`/start_game\` — начать игру
-\`/end_game\` — завершить игру
-
-💰 *ДЕНЬГИ:*
-\`/buyin сумма способ\` — бай-ин
-\`/rebuy сумма способ\` — ребай
-Способ: cash или zelle (по умолчанию cash)
-Примеры:
-  \`/buyin 100\`
-  \`/buyin 50 zelle\`
-  \`/rebuy 100 cash\`
-
-🎰 *КЭШАУТ:*
-\`/cashout $1 $5 $25 $100\`
-Введи количество фишек каждого номинала
-Пример: \`/cashout 10 6 2 1\`
-(= 10×$1 + 6×$5 + 2×$25 + 1×$100)
-
-📊 *ИНФОРМАЦИЯ:*
-\`/stats\` — твоя статистика
-\`/status\` — статус текущей игры
-\`/players\` — список игроков
-\`/help\` — эта справка`;
+export interface TelegramResponse {
+  text: string;
+  reply_markup?: {
+    inline_keyboard: Array<Array<{ text: string; callback_data: string }>>;
+  };
+}
 
 async function isPlayerAdmin(client: pg.PoolClient, telegramId: string): Promise<boolean> {
   const result = await client.query(
@@ -158,35 +130,167 @@ async function getPlayerCount(client: pg.PoolClient): Promise<number> {
   return parseInt(result.rows[0].count) || 0;
 }
 
-export async function handleCommand(telegramId: string, message: string): Promise<string> {
-  const text = message.trim();
-  const parts = text.split(/\s+/);
-  const command = parts[0].toLowerCase();
+async function getPlayer(client: pg.PoolClient, telegramId: string) {
+  const result = await client.query(
+    "SELECT * FROM poker_players WHERE telegram_id = $1",
+    [telegramId]
+  );
+  return result.rows[0] || null;
+}
+
+async function getActiveGame(client: pg.PoolClient) {
+  const result = await client.query(
+    "SELECT * FROM poker_games WHERE status = 'active'"
+  );
+  return result.rows[0] || null;
+}
+
+async function isPlayerInGame(client: pg.PoolClient, gameId: number, playerId: number): Promise<boolean> {
+  const result = await client.query(
+    "SELECT * FROM poker_transactions WHERE game_id = $1 AND player_id = $2",
+    [gameId, playerId]
+  );
+  return result.rows.length > 0;
+}
+
+async function hasPlayerCashedOut(client: pg.PoolClient, gameId: number, playerId: number): Promise<boolean> {
+  const result = await client.query(
+    "SELECT * FROM poker_transactions WHERE game_id = $1 AND player_id = $2 AND type = 'cashout'",
+    [gameId, playerId]
+  );
+  return result.rows.length > 0;
+}
+
+async function setPendingAction(client: pg.PoolClient, telegramId: string, actionType: string): Promise<void> {
+  await client.query("DELETE FROM poker_pending_actions WHERE telegram_id = $1", [telegramId]);
+  await client.query(
+    "INSERT INTO poker_pending_actions (telegram_id, action_type) VALUES ($1, $2)",
+    [telegramId, actionType]
+  );
+}
+
+async function getPendingAction(client: pg.PoolClient, telegramId: string): Promise<string | null> {
+  const result = await client.query(
+    "SELECT action_type FROM poker_pending_actions WHERE telegram_id = $1",
+    [telegramId]
+  );
+  return result.rows[0]?.action_type || null;
+}
+
+async function clearPendingAction(client: pg.PoolClient, telegramId: string): Promise<void> {
+  await client.query("DELETE FROM poker_pending_actions WHERE telegram_id = $1", [telegramId]);
+}
+
+function getMainMenuKeyboard(isAdmin: boolean, isInGame: boolean, hasActiveGame: boolean): TelegramResponse["reply_markup"] {
+  const keyboard: Array<Array<{ text: string; callback_data: string }>> = [];
   
+  if (hasActiveGame) {
+    if (!isInGame) {
+      keyboard.push([{ text: "🎮 Вступить в игру ($20)", callback_data: "join_game" }]);
+    } else {
+      keyboard.push([
+        { text: "💰 Rebuy +$20", callback_data: "rebuy" },
+        { text: "🎰 Кэшаут", callback_data: "cashout_start" }
+      ]);
+    }
+    keyboard.push([{ text: "📊 Статус игры", callback_data: "status" }]);
+  }
+  
+  if (isAdmin) {
+    if (!hasActiveGame) {
+      keyboard.push([{ text: "🎲 Начать игру", callback_data: "start_game" }]);
+    } else {
+      keyboard.push([{ text: "🏁 Завершить игру", callback_data: "end_game" }]);
+    }
+  }
+  
+  keyboard.push([
+    { text: "📈 Моя статистика", callback_data: "stats" },
+    { text: "👥 Игроки", callback_data: "players" }
+  ]);
+  
+  return { inline_keyboard: keyboard };
+}
+
+function getPaymentMethodKeyboard(actionType: string): TelegramResponse["reply_markup"] {
+  return {
+    inline_keyboard: [
+      [
+        { text: "💵 Cash", callback_data: `payment_${actionType}_cash` },
+        { text: "💳 Zelle", callback_data: `payment_${actionType}_zelle` }
+      ],
+      [{ text: "❌ Отмена", callback_data: "cancel" }]
+    ]
+  };
+}
+
+export async function handleCommand(telegramId: string, message: string): Promise<TelegramResponse> {
+  const text = message.trim();
   const client = await pool.connect();
+  
   try {
     await client.query('BEGIN');
     
-    if (command === "/start" || command === "/help") {
-      await client.query('COMMIT');
-      return HELP_MESSAGE;
-    }
+    const pendingAction = await getPendingAction(client, telegramId);
     
-    if (command === "/reg") {
-      const name = parts.slice(1).join(" ");
-      if (!name) {
-        await client.query('ROLLBACK');
-        return "❌ Укажи имя!\nПример: `/reg Андрей`";
+    if (pendingAction === "cashout_chips") {
+      const totalChips = parseInt(text);
+      if (isNaN(totalChips) || totalChips < 0) {
+        await client.query('COMMIT');
+        return {
+          text: "❌ Введи число фишек (например: 250)",
+          reply_markup: { inline_keyboard: [[{ text: "❌ Отмена", callback_data: "cancel" }]] }
+        };
       }
       
-      const existing = await client.query(
-        "SELECT * FROM poker_players WHERE telegram_id = $1",
-        [telegramId]
-      );
+      await clearPendingAction(client, telegramId);
+      await client.query('COMMIT');
+      client.release();
+      return await processCashout(telegramId, totalChips);
+    }
+    
+    if (text === "/start" || text === "/help" || text === "/menu") {
+      const player = await getPlayer(client, telegramId);
+      const activeGame = await getActiveGame(client);
       
-      if (existing.rows.length > 0) {
+      if (!player) {
+        await client.query('COMMIT');
+        return {
+          text: `🃏 *POKER БОТЯ*\n\nДобро пожаловать!\n\nСначала зарегистрируйся.\nОтправь: \`/reg Имя\`\n\nПример: \`/reg Андрей\``,
+        };
+      }
+      
+      const isAdmin = player.is_admin;
+      const isInGame = activeGame ? await isPlayerInGame(client, activeGame.id, player.id) : false;
+      const hasCashedOut = activeGame ? await hasPlayerCashedOut(client, activeGame.id, player.id) : false;
+      
+      await client.query('COMMIT');
+      
+      let statusText = activeGame 
+        ? `🟢 Игра #${activeGame.id} идёт`
+        : "🔴 Нет активной игры";
+      
+      if (isInGame && !hasCashedOut) {
+        statusText += "\n🎲 Ты в игре!";
+      }
+      
+      return {
+        text: `🃏 *POKER БОТЯ*\n\nПривет, ${player.name}! ${isAdmin ? "👑" : ""}\n\n${statusText}\n\nВыбери действие:`,
+        reply_markup: getMainMenuKeyboard(isAdmin, isInGame && !hasCashedOut, !!activeGame)
+      };
+    }
+    
+    if (text.startsWith("/reg ")) {
+      const name = text.slice(5).trim();
+      if (!name) {
         await client.query('ROLLBACK');
-        return `⚠️ Ты уже зарегистрирован как ${existing.rows[0].name}!`;
+        return { text: "❌ Укажи имя!\nПример: `/reg Андрей`" };
+      }
+      
+      const existing = await getPlayer(client, telegramId);
+      if (existing) {
+        await client.query('ROLLBACK');
+        return { text: `⚠️ Ты уже зарегистрирован как ${existing.name}!\n\nОтправь /menu для главного меню.` };
       }
       
       const playerCount = await getPlayerCount(client);
@@ -197,26 +301,72 @@ export async function handleCommand(telegramId: string, message: string): Promis
         [telegramId, name, isFirstPlayer]
       );
       
+      const activeGame = await getActiveGame(client);
       await client.query('COMMIT');
       
       const adminNote = isFirstPlayer ? "\n👑 Ты первый игрок — теперь ты админ!" : "";
-      return `🎉 Добро пожаловать, ${name}!${adminNote}\n\nНапиши /help для списка команд.`;
+      
+      return {
+        text: `🎉 Добро пожаловать, ${name}!${adminNote}\n\nНажми кнопку ниже:`,
+        reply_markup: getMainMenuKeyboard(isFirstPlayer, false, !!activeGame)
+      };
     }
     
-    if (command === "/start_game") {
-      const isAdmin = await isPlayerAdmin(client, telegramId);
+    await client.query('COMMIT');
+    
+    const player = await getPlayer(client, telegramId);
+    if (!player) {
+      return { text: "❌ Сначала зарегистрируйся!\n\nОтправь: `/reg Имя`" };
+    }
+    
+    return {
+      text: "❓ Не понял команду.\n\nИспользуй /menu для главного меню.",
+    };
+    
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error("Command error:", error);
+    return { text: "❌ Произошла ошибка. Попробуй ещё раз." };
+  } finally {
+    client.release();
+  }
+}
+
+export async function handleCallbackQuery(telegramId: string, callbackData: string): Promise<TelegramResponse> {
+  const client = await pool.connect();
+  
+  try {
+    await client.query('BEGIN');
+    
+    const player = await getPlayer(client, telegramId);
+    if (!player) {
+      await client.query('COMMIT');
+      return { text: "❌ Сначала зарегистрируйся!\n\nОтправь: `/reg Имя`" };
+    }
+    
+    const activeGame = await getActiveGame(client);
+    const isAdmin = player.is_admin;
+    const isInGame = activeGame ? await isPlayerInGame(client, activeGame.id, player.id) : false;
+    const hasCashedOut = activeGame ? await hasPlayerCashedOut(client, activeGame.id, player.id) : false;
+    
+    if (callbackData === "cancel") {
+      await clearPendingAction(client, telegramId);
+      await client.query('COMMIT');
+      return {
+        text: "❌ Действие отменено.\n\nВыбери новое действие:",
+        reply_markup: getMainMenuKeyboard(isAdmin, isInGame && !hasCashedOut, !!activeGame)
+      };
+    }
+    
+    if (callbackData === "start_game") {
       if (!isAdmin) {
-        await client.query('ROLLBACK');
-        return "⛔ Только админ может начать игру!";
+        await client.query('COMMIT');
+        return { text: "⛔ Только админ может начать игру!" };
       }
       
-      const activeGame = await client.query(
-        "SELECT * FROM poker_games WHERE status = 'active'"
-      );
-      
-      if (activeGame.rows.length > 0) {
-        await client.query('ROLLBACK');
-        return "⚠️ Игра уже идёт! Сначала заверши её командой /end_game";
+      if (activeGame) {
+        await client.query('COMMIT');
+        return { text: "⚠️ Игра уже идёт!" };
       }
       
       const result = await client.query(
@@ -226,26 +376,179 @@ export async function handleCommand(telegramId: string, message: string): Promis
       await client.query('COMMIT');
       
       const gameId = result.rows[0].id;
-      return `🃏 *ИГРА #${gameId} НАЧАЛАСЬ!*\n\nИгроки, делайте бай-ины!\nКоманда: \`/buyin сумма\``;
+      return {
+        text: `🃏 *ИГРА #${gameId} НАЧАЛАСЬ!*\n\nИгроки, присоединяйтесь!\nBuy-in: $${BUYIN_AMOUNT} (${CHIPS_PER_BUYIN} фишек)`,
+        reply_markup: {
+          inline_keyboard: [
+            [{ text: "🎮 Вступить в игру ($20)", callback_data: "join_game" }],
+            [{ text: "📊 Статус игры", callback_data: "status" }]
+          ]
+        }
+      };
     }
     
-    if (command === "/end_game") {
-      const isAdmin = await isPlayerAdmin(client, telegramId);
-      if (!isAdmin) {
-        await client.query('ROLLBACK');
-        return "⛔ Только админ может завершить игру!";
+    if (callbackData === "join_game") {
+      if (!activeGame) {
+        await client.query('COMMIT');
+        return { text: "❌ Нет активной игры!" };
       }
       
-      const game = await client.query(
-        "SELECT * FROM poker_games WHERE status = 'active'"
+      if (isInGame) {
+        await client.query('COMMIT');
+        return { text: "⚠️ Ты уже в игре!" };
+      }
+      
+      await client.query('COMMIT');
+      return {
+        text: `🎮 *Вступление в игру*\n\nBuy-in: $${BUYIN_AMOUNT} (${CHIPS_PER_BUYIN} фишек)\n\nВыбери способ оплаты:`,
+        reply_markup: getPaymentMethodKeyboard("buyin")
+      };
+    }
+    
+    if (callbackData === "rebuy") {
+      if (!activeGame) {
+        await client.query('COMMIT');
+        return { text: "❌ Нет активной игры!" };
+      }
+      
+      if (!isInGame) {
+        await client.query('COMMIT');
+        return { text: "❌ Ты не в игре!" };
+      }
+      
+      if (hasCashedOut) {
+        await client.query('COMMIT');
+        return { text: "❌ Ты уже сделал кэшаут!" };
+      }
+      
+      await client.query('COMMIT');
+      return {
+        text: `💰 *Rebuy +$${BUYIN_AMOUNT}*\n\nПолучишь ещё ${CHIPS_PER_BUYIN} фишек.\n\nВыбери способ оплаты:`,
+        reply_markup: getPaymentMethodKeyboard("rebuy")
+      };
+    }
+    
+    if (callbackData.startsWith("payment_")) {
+      const parts = callbackData.split("_");
+      const actionType = parts[1];
+      const paymentMethod = parts[2];
+      
+      if (!activeGame) {
+        await client.query('COMMIT');
+        return { text: "❌ Нет активной игры!" };
+      }
+      
+      if (actionType === "rebuy" && hasCashedOut) {
+        await client.query('COMMIT');
+        return { text: "❌ Ты уже сделал кэшаут!" };
+      }
+      
+      await client.query(
+        `INSERT INTO poker_transactions (game_id, player_id, type, amount, payment_method)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [activeGame.id, player.id, actionType, BUYIN_AMOUNT, paymentMethod]
       );
       
-      if (game.rows.length === 0) {
-        await client.query('ROLLBACK');
-        return "❌ Нет активной игры!";
+      await client.query('COMMIT');
+      
+      const actionName = actionType === "buyin" ? "Buy-in" : "Rebuy";
+      const paymentName = paymentMethod === "cash" ? "💵 Cash" : "💳 Zelle";
+      
+      return {
+        text: `✅ *${actionName} записан!*\n\n💰 Сумма: $${BUYIN_AMOUNT}\n🎰 Фишки: ${CHIPS_PER_BUYIN}\n${paymentName}\n\n${player.name}, удачи за столом! 🍀`,
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: "💰 Rebuy +$20", callback_data: "rebuy" },
+              { text: "🎰 Кэшаут", callback_data: "cashout_start" }
+            ],
+            [{ text: "📊 Статус игры", callback_data: "status" }]
+          ]
+        }
+      };
+    }
+    
+    if (callbackData === "cashout_start") {
+      if (!activeGame) {
+        await client.query('COMMIT');
+        return { text: "❌ Нет активной игры!" };
       }
       
-      const gameId = game.rows[0].id;
+      if (!isInGame) {
+        await client.query('COMMIT');
+        return { text: "❌ Ты не в игре!" };
+      }
+      
+      if (hasCashedOut) {
+        await client.query('COMMIT');
+        return { text: "❌ Ты уже сделал кэшаут!" };
+      }
+      
+      await setPendingAction(client, telegramId, "cashout_chips");
+      await client.query('COMMIT');
+      
+      return {
+        text: `🎰 *Кэшаут*\n\nСколько фишек у тебя осталось?\n\n_Напиши общее количество фишек числом._\n_Например: 250_\n\n(${CHIPS_PER_BUYIN} фишек = $${BUYIN_AMOUNT})`,
+        reply_markup: { inline_keyboard: [[{ text: "❌ Отмена", callback_data: "cancel" }]] }
+      };
+    }
+    
+    if (callbackData === "status") {
+      if (!activeGame) {
+        await client.query('COMMIT');
+        return {
+          text: "🔴 Сейчас нет активной игры.",
+          reply_markup: getMainMenuKeyboard(isAdmin, false, false)
+        };
+      }
+      
+      const transactions = await client.query(`
+        SELECT p.name,
+          SUM(CASE WHEN t.type IN ('buyin', 'rebuy') THEN t.amount ELSE 0 END) as total_in,
+          COUNT(CASE WHEN t.type = 'rebuy' THEN 1 END) as rebuy_count,
+          MAX(CASE WHEN t.type = 'cashout' THEN 1 ELSE 0 END) as cashed_out
+        FROM poker_transactions t
+        JOIN poker_players p ON t.player_id = p.id
+        WHERE t.game_id = $1
+        GROUP BY p.id, p.name
+      `, [activeGame.id]);
+      
+      await client.query('COMMIT');
+      
+      let totalBank = 0;
+      let message = `🟢 *ИГРА #${activeGame.id} — ИДЁТ*\n━━━━━━━━━━━━━━━━━━━━━\n`;
+      
+      for (const row of transactions.rows) {
+        const totalIn = parseFloat(row.total_in) || 0;
+        const rebuyCount = parseInt(row.rebuy_count) || 0;
+        const status = row.cashed_out ? "✅" : "🎲";
+        const rebuyText = rebuyCount > 0 ? ` (+${rebuyCount} rebuy)` : "";
+        message += `${status} ${row.name}: $${totalIn.toFixed(0)}${rebuyText}\n`;
+        totalBank += totalIn;
+      }
+      
+      if (transactions.rows.length === 0) {
+        message += "_Пока никто не зашёл в игру_\n";
+      }
+      
+      message += `━━━━━━━━━━━━━━━━━━━━━\n💰 В банке: *$${totalBank.toFixed(0)}*`;
+      
+      return {
+        text: message,
+        reply_markup: getMainMenuKeyboard(isAdmin, isInGame && !hasCashedOut, true)
+      };
+    }
+    
+    if (callbackData === "end_game") {
+      if (!isAdmin) {
+        await client.query('COMMIT');
+        return { text: "⛔ Только админ может завершить игру!" };
+      }
+      
+      if (!activeGame) {
+        await client.query('COMMIT');
+        return { text: "❌ Нет активной игры!" };
+      }
       
       const transactions = await client.query(`
         SELECT p.name, p.telegram_id,
@@ -256,9 +559,9 @@ export async function handleCommand(telegramId: string, message: string): Promis
         JOIN poker_players p ON t.player_id = p.id
         WHERE t.game_id = $1
         GROUP BY p.id, p.name, p.telegram_id
-      `, [gameId]);
+      `, [activeGame.id]);
       
-      let report = `🏁 *ИГРА #${gameId} ЗАВЕРШЕНА!*\n\n📊 РЕЗУЛЬТАТЫ:\n━━━━━━━━━━━━━━━━━━━━━\n`;
+      let report = `🏁 *ИГРА #${activeGame.id} ЗАВЕРШЕНА!*\n\n📊 РЕЗУЛЬТАТЫ:\n━━━━━━━━━━━━━━━━━━━━━\n`;
       let totalBank = 0;
       
       const results: { name: string; result: number }[] = [];
@@ -281,142 +584,26 @@ export async function handleCommand(telegramId: string, message: string): Promis
         report += `   _${phrase}_\n\n`;
       }
       
+      if (results.length === 0) {
+        report += "_Никто не играл_\n\n";
+      }
+      
       report += `━━━━━━━━━━━━━━━━━━━━━\n💰 Общий банк: $${totalBank.toFixed(0)}`;
       
       await client.query(
         "UPDATE poker_games SET status = 'ended', ended_at = CURRENT_TIMESTAMP WHERE id = $1",
-        [gameId]
+        [activeGame.id]
       );
       
       await client.query('COMMIT');
       
-      return report;
+      return {
+        text: report,
+        reply_markup: getMainMenuKeyboard(isAdmin, false, false)
+      };
     }
     
-    if (command === "/buyin" || command === "/rebuy") {
-      const player = await client.query(
-        "SELECT * FROM poker_players WHERE telegram_id = $1",
-        [telegramId]
-      );
-      
-      if (player.rows.length === 0) {
-        await client.query('ROLLBACK');
-        return "❌ Сначала зарегистрируйся!\nКоманда: `/reg Имя`";
-      }
-      
-      const activeGame = await client.query(
-        "SELECT * FROM poker_games WHERE status = 'active'"
-      );
-      
-      if (activeGame.rows.length === 0) {
-        await client.query('ROLLBACK');
-        return "❌ Нет активной игры! Попроси админа начать игру.";
-      }
-      
-      const amount = parseInt(parts[1]);
-      if (!amount || amount <= 0) {
-        await client.query('ROLLBACK');
-        return `❌ Укажи сумму!\nПример: \`${command} 100\` или \`${command} 50 zelle\``;
-      }
-      
-      const paymentMethod = parts[2]?.toLowerCase() === "zelle" ? "zelle" : "cash";
-      const type = command === "/buyin" ? "buyin" : "rebuy";
-      
-      await client.query(
-        `INSERT INTO poker_transactions (game_id, player_id, type, amount, payment_method)
-         VALUES ($1, $2, $3, $4, $5)`,
-        [activeGame.rows[0].id, player.rows[0].id, type, amount, paymentMethod]
-      );
-      
-      await client.query('COMMIT');
-      
-      const actionName = type === "buyin" ? "Бай-ин" : "Ребай";
-      return `💵 ${actionName} *$${amount}* (${paymentMethod}) записан!\n\n${player.rows[0].name}, удачи за столом! 🍀`;
-    }
-    
-    if (command === "/cashout") {
-      const player = await client.query(
-        "SELECT * FROM poker_players WHERE telegram_id = $1",
-        [telegramId]
-      );
-      
-      if (player.rows.length === 0) {
-        await client.query('ROLLBACK');
-        return "❌ Ты не зарегистрирован!";
-      }
-      
-      const activeGame = await client.query(
-        "SELECT * FROM poker_games WHERE status = 'active'"
-      );
-      
-      if (activeGame.rows.length === 0) {
-        await client.query('ROLLBACK');
-        return "❌ Нет активной игры!";
-      }
-      
-      if (parts.length < 5) {
-        await client.query('ROLLBACK');
-        return `❌ Укажи количество фишек каждого номинала!
-
-Формат: \`/cashout $1 $5 $25 $100\`
-
-Пример: \`/cashout 10 6 2 1\`
-= 10×$1 + 6×$5 + 2×$25 + 1×$100 = *$190*`;
-      }
-      
-      const c1 = parseInt(parts[1]) || 0;
-      const c5 = parseInt(parts[2]) || 0;
-      const c25 = parseInt(parts[3]) || 0;
-      const c100 = parseInt(parts[4]) || 0;
-      const totalChips = c1 * 1 + c5 * 5 + c25 * 25 + c100 * 100;
-      
-      const buyins = await client.query(`
-        SELECT COALESCE(SUM(amount), 0) as total
-        FROM poker_transactions
-        WHERE game_id = $1 AND player_id = $2 AND type IN ('buyin', 'rebuy')
-      `, [activeGame.rows[0].id, player.rows[0].id]);
-      
-      const totalIn = parseFloat(buyins.rows[0].total) || 0;
-      const netResult = totalChips - totalIn;
-      
-      await client.query(
-        `INSERT INTO poker_transactions (game_id, player_id, type, amount, net_result, chips_1, chips_5, chips_25, chips_100)
-         VALUES ($1, $2, 'cashout', $3, $4, $5, $6, $7, $8)`,
-        [activeGame.rows[0].id, player.rows[0].id, totalChips, netResult, c1, c5, c25, c100]
-      );
-      
-      await client.query('COMMIT');
-      
-      const phrase = getRandomPhrase(netResult);
-      const sign = netResult >= 0 ? "+" : "";
-      const resultEmoji = netResult >= 0 ? "📈" : "📉";
-      
-      let message = `🎰 *КЭШАУТ: ${player.rows[0].name}*\n`;
-      message += `━━━━━━━━━━━━━━━━━━━━━\n`;
-      message += `💰 Фишки: *$${totalChips}*\n`;
-      message += `  • $1 × ${c1} = $${c1}\n`;
-      message += `  • $5 × ${c5} = $${c5 * 5}\n`;
-      message += `  • $25 × ${c25} = $${c25 * 25}\n`;
-      message += `  • $100 × ${c100} = $${c100 * 100}\n`;
-      message += `━━━━━━━━━━━━━━━━━━━━━\n`;
-      message += `📥 Вложено: $${totalIn}\n`;
-      message += `${resultEmoji} Результат: *${sign}$${netResult.toFixed(0)}*\n\n`;
-      message += `_${phrase}_`;
-      
-      return message;
-    }
-    
-    if (command === "/stats") {
-      const player = await client.query(
-        "SELECT * FROM poker_players WHERE telegram_id = $1",
-        [telegramId]
-      );
-      
-      if (player.rows.length === 0) {
-        await client.query('ROLLBACK');
-        return "❌ Ты не зарегистрирован!\nКоманда: `/reg Имя`";
-      }
-      
+    if (callbackData === "stats") {
       const gameResults = await client.query(`
         SELECT 
           t.game_id,
@@ -424,7 +611,7 @@ export async function handleCommand(telegramId: string, message: string): Promis
         FROM poker_transactions t
         WHERE t.player_id = $1 AND t.type = 'cashout'
         GROUP BY t.game_id
-      `, [player.rows[0].id]);
+      `, [player.id]);
       
       const results = gameResults.rows.map(r => parseFloat(r.game_result) || 0);
       const totalGames = results.length;
@@ -438,7 +625,7 @@ export async function handleCommand(telegramId: string, message: string): Promis
       const sign = totalResult >= 0 ? "+" : "";
       const resultEmoji = totalResult >= 0 ? "📈" : "📉";
       
-      let message = `📊 *СТАТИСТИКА: ${player.rows[0].name}*\n`;
+      let message = `📊 *СТАТИСТИКА: ${player.name}*\n`;
       message += `━━━━━━━━━━━━━━━━━━━━━\n`;
       message += `🎲 Игр сыграно: ${totalGames}\n`;
       message += `${resultEmoji} Общий результат: *${sign}$${totalResult.toFixed(0)}*\n`;
@@ -449,49 +636,13 @@ export async function handleCommand(telegramId: string, message: string): Promis
         message += `😢 Худший результат: $${worstResult.toFixed(0)}\n`;
       }
       
-      return message;
+      return {
+        text: message,
+        reply_markup: getMainMenuKeyboard(isAdmin, isInGame && !hasCashedOut, !!activeGame)
+      };
     }
     
-    if (command === "/status") {
-      const activeGame = await client.query(
-        "SELECT * FROM poker_games WHERE status = 'active'"
-      );
-      
-      if (activeGame.rows.length === 0) {
-        await client.query('COMMIT');
-        return "🔴 Сейчас нет активной игры.\n\nАдмин может начать игру командой /start_game";
-      }
-      
-      const gameId = activeGame.rows[0].id;
-      
-      const transactions = await client.query(`
-        SELECT p.name,
-          SUM(CASE WHEN t.type IN ('buyin', 'rebuy') THEN t.amount ELSE 0 END) as total_in,
-          MAX(CASE WHEN t.type = 'cashout' THEN 1 ELSE 0 END) as cashed_out
-        FROM poker_transactions t
-        JOIN poker_players p ON t.player_id = p.id
-        WHERE t.game_id = $1
-        GROUP BY p.id, p.name
-      `, [gameId]);
-      
-      await client.query('COMMIT');
-      
-      let totalBank = 0;
-      let message = `🟢 *ИГРА #${gameId} — ИДЁТ*\n━━━━━━━━━━━━━━━━━━━━━\n`;
-      
-      for (const row of transactions.rows) {
-        const totalIn = parseFloat(row.total_in) || 0;
-        const status = row.cashed_out ? "✅" : "🎲";
-        message += `${status} ${row.name}: $${totalIn.toFixed(0)}\n`;
-        totalBank += totalIn;
-      }
-      
-      message += `━━━━━━━━━━━━━━━━━━━━━\n💰 В банке: *$${totalBank.toFixed(0)}*`;
-      
-      return message;
-    }
-    
-    if (command === "/players") {
+    if (callbackData === "players") {
       const players = await client.query(
         "SELECT name, is_admin FROM poker_players ORDER BY created_at"
       );
@@ -499,7 +650,10 @@ export async function handleCommand(telegramId: string, message: string): Promis
       await client.query('COMMIT');
       
       if (players.rows.length === 0) {
-        return "📋 Пока нет зарегистрированных игроков.\n\nРегистрация: `/reg Имя`";
+        return {
+          text: "📋 Пока нет зарегистрированных игроков.",
+          reply_markup: getMainMenuKeyboard(isAdmin, isInGame && !hasCashedOut, !!activeGame)
+        };
       }
       
       let message = "📋 *ИГРОКИ:*\n━━━━━━━━━━━━━━━━━━━━━\n";
@@ -508,16 +662,89 @@ export async function handleCommand(telegramId: string, message: string): Promis
         message += `• ${p.name}${admin}\n`;
       }
       
-      return message;
+      return {
+        text: message,
+        reply_markup: getMainMenuKeyboard(isAdmin, isInGame && !hasCashedOut, !!activeGame)
+      };
     }
     
     await client.query('COMMIT');
-    return `❓ Неизвестная команда.\n\nНапиши /help для списка команд.`;
+    return {
+      text: "❓ Неизвестное действие.",
+      reply_markup: getMainMenuKeyboard(isAdmin, isInGame && !hasCashedOut, !!activeGame)
+    };
     
   } catch (error) {
     await client.query('ROLLBACK');
-    console.error("Command error:", error);
-    return "❌ Произошла ошибка. Попробуй ещё раз.";
+    console.error("Callback error:", error);
+    return { text: "❌ Произошла ошибка. Попробуй ещё раз." };
+  } finally {
+    client.release();
+  }
+}
+
+async function processCashout(telegramId: string, totalChips: number): Promise<TelegramResponse> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    
+    const player = await getPlayer(client, telegramId);
+    const activeGame = await getActiveGame(client);
+    
+    if (!player || !activeGame) {
+      await client.query('COMMIT');
+      return { text: "❌ Ошибка: игрок или игра не найдены." };
+    }
+    
+    const totalAmount = (totalChips / CHIPS_PER_BUYIN) * BUYIN_AMOUNT;
+    
+    const buyins = await client.query(`
+      SELECT COALESCE(SUM(amount), 0) as total
+      FROM poker_transactions
+      WHERE game_id = $1 AND player_id = $2 AND type IN ('buyin', 'rebuy')
+    `, [activeGame.id, player.id]);
+    
+    const totalIn = parseFloat(buyins.rows[0].total) || 0;
+    const netResult = totalAmount - totalIn;
+    
+    await client.query(
+      `INSERT INTO poker_transactions (game_id, player_id, type, amount, net_result, chips_total)
+       VALUES ($1, $2, 'cashout', $3, $4, $5)`,
+      [activeGame.id, player.id, totalAmount, netResult, totalChips]
+    );
+    
+    await client.query('COMMIT');
+    
+    const phrase = getRandomPhrase(netResult);
+    const sign = netResult >= 0 ? "+" : "";
+    const resultEmoji = netResult >= 0 ? "📈" : "📉";
+    
+    let message = `🎰 *КЭШАУТ: ${player.name}*\n`;
+    message += `━━━━━━━━━━━━━━━━━━━━━\n`;
+    message += `🎲 Фишек: ${totalChips}\n`;
+    message += `💰 Сумма: *$${totalAmount.toFixed(0)}*\n`;
+    message += `━━━━━━━━━━━━━━━━━━━━━\n`;
+    message += `📥 Вложено: $${totalIn.toFixed(0)}\n`;
+    message += `${resultEmoji} Результат: *${sign}$${netResult.toFixed(0)}*\n\n`;
+    message += `_${phrase}_`;
+    
+    const isAdmin = player.is_admin;
+    
+    return {
+      text: message,
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "📊 Статус игры", callback_data: "status" }],
+          [{ text: "📈 Моя статистика", callback_data: "stats" }],
+          ...(isAdmin ? [[{ text: "🏁 Завершить игру", callback_data: "end_game" }]] : [])
+        ]
+      }
+    };
+    
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error("Cashout error:", error);
+    return { text: "❌ Ошибка при кэшауте. Попробуй ещё раз." };
   } finally {
     client.release();
   }
