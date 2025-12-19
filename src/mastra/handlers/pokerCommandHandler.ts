@@ -200,7 +200,11 @@ function getMainMenuKeyboard(isAdmin: boolean, isInGame: boolean, hasActiveGame:
     if (!hasActiveGame) {
       keyboard.push([{ text: "🎲 Начать игру", callback_data: "start_game" }]);
     } else {
-      keyboard.push([{ text: "🏁 Завершить игру", callback_data: "end_game" }]);
+      keyboard.push([
+        { text: "➕ Добавить гостя", callback_data: "add_guest" },
+        { text: "🏁 Завершить игру", callback_data: "end_game" }
+      ]);
+      keyboard.push([{ text: "🎰 Кэшаут гостя", callback_data: "guest_cashout_select" }]);
     }
     keyboard.push([{ text: "🗑️ Обнулить статистику", callback_data: "reset_stats_confirm" }]);
   }
@@ -278,6 +282,68 @@ export async function handleCommand(telegramId: string, message: string): Promis
       await clearPendingAction(client, telegramId);
       await client.query('COMMIT');
       const result = await processCashout(telegramId, totalChips);
+      return result;
+    }
+    
+    if (pendingAction === "add_guest_name") {
+      const guestName = text.trim();
+      if (!guestName || guestName.startsWith("/")) {
+        await client.query('COMMIT');
+        return {
+          text: "❌ Введите имя гостя (без команд):",
+          reply_markup: { inline_keyboard: [[{ text: "❌ Отмена", callback_data: "cancel" }]] }
+        };
+      }
+      
+      await clearPendingAction(client, telegramId);
+      
+      const guestTelegramId = `guest_${Date.now()}`;
+      await client.query(
+        "INSERT INTO poker_players (telegram_id, name, is_admin) VALUES ($1, $2, false)",
+        [guestTelegramId, guestName]
+      );
+      
+      const newGuest = await client.query(
+        "SELECT id FROM poker_players WHERE telegram_id = $1",
+        [guestTelegramId]
+      );
+      
+      await client.query(
+        "INSERT INTO poker_pending_actions (telegram_id, action, context) VALUES ($1, $2, $3) ON CONFLICT (telegram_id) DO UPDATE SET action = $2, context = $3",
+        [telegramId, "guest_buyin_payment", JSON.stringify({ guestId: newGuest.rows[0].id, guestName })]
+      );
+      
+      await client.query('COMMIT');
+      
+      return {
+        text: `👤 Гость *${guestName}* добавлен!\n\nВыберите способ оплаты для buy-in $${BUYIN_AMOUNT}:`,
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: "💵 Cash", callback_data: "guest_pay_cash" },
+              { text: "💳 Zelle", callback_data: "guest_pay_zelle" }
+            ],
+            [{ text: "❌ Отмена", callback_data: "cancel" }]
+          ]
+        }
+      };
+    }
+    
+    if (pendingAction?.startsWith("guest_cashout_chips:")) {
+      const guestId = parseInt(pendingAction.split(":")[1]);
+      const totalChips = parseInt(text);
+      
+      if (isNaN(totalChips) || totalChips < 0) {
+        await client.query('COMMIT');
+        return {
+          text: "❌ Введите число фишек (например: 250)",
+          reply_markup: { inline_keyboard: [[{ text: "❌ Отмена", callback_data: "cancel" }]] }
+        };
+      }
+      
+      await clearPendingAction(client, telegramId);
+      await client.query('COMMIT');
+      const result = await processGuestCashout(guestId, totalChips);
       return result;
     }
     
@@ -771,6 +837,71 @@ export async function handleCallbackQuery(telegramId: string, callbackData: stri
     await client.query('ROLLBACK');
     console.error("Callback error:", error);
     return { text: "❌ Произошла ошибка. Попробуй ещё раз." };
+  } finally {
+    client.release();
+  }
+}
+
+async function processGuestCashout(guestPlayerId: number, totalChips: number): Promise<TelegramResponse> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    
+    const guestResult = await client.query("SELECT * FROM poker_players WHERE id = $1", [guestPlayerId]);
+    const guest = guestResult.rows[0];
+    const activeGame = await getActiveGame(client);
+    
+    if (!guest || !activeGame) {
+      await client.query('COMMIT');
+      return { text: "❌ Ошибка: гость или игра не найдены." };
+    }
+    
+    const totalAmount = (totalChips / CHIPS_PER_BUYIN) * BUYIN_AMOUNT;
+    
+    const buyins = await client.query(`
+      SELECT COALESCE(SUM(amount), 0) as total
+      FROM poker_transactions
+      WHERE game_id = $1 AND player_id = $2 AND type IN ('buyin', 'rebuy')
+    `, [activeGame.id, guest.id]);
+    
+    const totalIn = parseFloat(buyins.rows[0].total) || 0;
+    const netResult = totalAmount - totalIn;
+    
+    await client.query(
+      `INSERT INTO poker_transactions (game_id, player_id, type, amount, net_result, chips_total)
+       VALUES ($1, $2, 'cashout', $3, $4, $5)`,
+      [activeGame.id, guest.id, totalAmount, netResult, totalChips]
+    );
+    
+    await client.query('COMMIT');
+    
+    const phrase = getRandomPhrase(netResult);
+    const sign = netResult >= 0 ? "+" : "";
+    const resultEmoji = netResult >= 0 ? "📈" : "📉";
+    
+    let message = `🎰 *КЭШАУТ ГОСТЯ: ${guest.name}*\n`;
+    message += `━━━━━━━━━━━━━━━━━━━━━\n`;
+    message += `🎲 Фишек: ${totalChips}\n`;
+    message += `💰 Сумма: *$${totalAmount.toFixed(0)}*\n`;
+    message += `━━━━━━━━━━━━━━━━━━━━━\n`;
+    message += `📥 Вложено: $${totalIn.toFixed(0)}\n`;
+    message += `${resultEmoji} Результат: *${sign}$${netResult.toFixed(0)}*\n\n`;
+    message += `_${phrase}_`;
+    
+    return {
+      text: message,
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "📊 Статус игры", callback_data: "status" }],
+          [{ text: "🏁 Завершить игру", callback_data: "end_game" }]
+        ]
+      }
+    };
+    
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error("Guest cashout error:", error);
+    return { text: "❌ Ошибка при кэшауте гостя. Попробуй ещё раз." };
   } finally {
     client.release();
   }
