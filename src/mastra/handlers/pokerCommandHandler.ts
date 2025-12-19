@@ -246,8 +246,8 @@ export async function handleCommand(telegramId: string, message: string): Promis
       
       await clearPendingAction(client, telegramId);
       await client.query('COMMIT');
-      client.release();
-      return await processCashout(telegramId, totalChips);
+      const result = await processCashout(telegramId, totalChips);
+      return result;
     }
     
     if (text === "/start" || text === "/help" || text === "/menu") {
