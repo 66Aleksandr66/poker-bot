@@ -15,9 +15,10 @@
 ## Bot Interface
 
 ### Button-Based Flow
-1. `/reg Имя` — Register player (text command)
-2. `/menu` or `/start` — Show main menu with buttons
-3. All other actions via inline buttons
+1. `/start` — Prompts "Введите ваше имя:" for new users
+2. User types name (no command needed)
+3. `/menu` or `/start` — Show main menu with buttons
+4. All other actions via inline buttons
 
 ### Main Menu Buttons
 | Button | Description |

@@ -234,6 +234,37 @@ export async function handleCommand(telegramId: string, message: string): Promis
     
     const pendingAction = await getPendingAction(client, telegramId);
     
+    if (pendingAction === "register_name") {
+      const name = text.trim();
+      if (!name || name.startsWith("/")) {
+        await client.query('COMMIT');
+        return {
+          text: "❌ Введите ваше имя (без команд):",
+          reply_markup: { inline_keyboard: [[{ text: "❌ Отмена", callback_data: "cancel" }]] }
+        };
+      }
+      
+      await clearPendingAction(client, telegramId);
+      
+      const playerCount = await getPlayerCount(client);
+      const isFirstPlayer = playerCount === 0;
+      
+      await client.query(
+        "INSERT INTO poker_players (telegram_id, name, is_admin) VALUES ($1, $2, $3)",
+        [telegramId, name, isFirstPlayer]
+      );
+      
+      const activeGame = await getActiveGame(client);
+      await client.query('COMMIT');
+      
+      const adminNote = isFirstPlayer ? "\n👑 Ты первый игрок — теперь ты админ!" : "";
+      
+      return {
+        text: `🎉 Добро пожаловать, ${name}!${adminNote}\n\nНажми кнопку ниже:`,
+        reply_markup: getMainMenuKeyboard(isFirstPlayer, false, !!activeGame)
+      };
+    }
+    
     if (pendingAction === "cashout_chips") {
       const totalChips = parseInt(text);
       if (isNaN(totalChips) || totalChips < 0) {
@@ -255,9 +286,11 @@ export async function handleCommand(telegramId: string, message: string): Promis
       const activeGame = await getActiveGame(client);
       
       if (!player) {
+        await setPendingAction(client, telegramId, "register_name");
         await client.query('COMMIT');
         return {
-          text: `🃏 *POKER БОТЯ*\n\nДобро пожаловать!\n\nСначала зарегистрируйся.\nОтправь: \`/reg Имя\`\n\nПример: \`/reg Андрей\``,
+          text: `🃏 *POKER БОТЯ*\n\nДобро пожаловать!\n\nВведите ваше имя:`,
+          reply_markup: { inline_keyboard: [[{ text: "❌ Отмена", callback_data: "cancel" }]] }
         };
       }
       
@@ -281,44 +314,18 @@ export async function handleCommand(telegramId: string, message: string): Promis
       };
     }
     
-    if (text.startsWith("/reg ")) {
-      const name = text.slice(5).trim();
-      if (!name) {
-        await client.query('ROLLBACK');
-        return { text: "❌ Укажи имя!\nПример: `/reg Андрей`" };
-      }
-      
-      const existing = await getPlayer(client, telegramId);
-      if (existing) {
-        await client.query('ROLLBACK');
-        return { text: `⚠️ Ты уже зарегистрирован как ${existing.name}!\n\nОтправь /menu для главного меню.` };
-      }
-      
-      const playerCount = await getPlayerCount(client);
-      const isFirstPlayer = playerCount === 0;
-      
-      await client.query(
-        "INSERT INTO poker_players (telegram_id, name, is_admin) VALUES ($1, $2, $3)",
-        [telegramId, name, isFirstPlayer]
-      );
-      
-      const activeGame = await getActiveGame(client);
+    
+    const player = await getPlayer(client, telegramId);
+    if (!player) {
+      await setPendingAction(client, telegramId, "register_name");
       await client.query('COMMIT');
-      
-      const adminNote = isFirstPlayer ? "\n👑 Ты первый игрок — теперь ты админ!" : "";
-      
-      return {
-        text: `🎉 Добро пожаловать, ${name}!${adminNote}\n\nНажми кнопку ниже:`,
-        reply_markup: getMainMenuKeyboard(isFirstPlayer, false, !!activeGame)
+      return { 
+        text: "🃏 *POKER БОТЯ*\n\nДобро пожаловать!\n\nВведите ваше имя:",
+        reply_markup: { inline_keyboard: [[{ text: "❌ Отмена", callback_data: "cancel" }]] }
       };
     }
     
     await client.query('COMMIT');
-    
-    const player = await getPlayer(client, telegramId);
-    if (!player) {
-      return { text: "❌ Сначала зарегистрируйся!\n\nОтправь: `/reg Имя`" };
-    }
     
     return {
       text: "❓ Не понял команду.\n\nИспользуй /menu для главного меню.",
@@ -341,8 +348,17 @@ export async function handleCallbackQuery(telegramId: string, callbackData: stri
     
     const player = await getPlayer(client, telegramId);
     if (!player) {
+      if (callbackData === "cancel") {
+        await clearPendingAction(client, telegramId);
+        await client.query('COMMIT');
+        return { text: "❌ Регистрация отменена.\n\nОтправь /start чтобы начать заново." };
+      }
+      await setPendingAction(client, telegramId, "register_name");
       await client.query('COMMIT');
-      return { text: "❌ Сначала зарегистрируйся!\n\nОтправь: `/reg Имя`" };
+      return { 
+        text: "❌ Сначала зарегистрируйся!\n\nВведите ваше имя:",
+        reply_markup: { inline_keyboard: [[{ text: "❌ Отмена", callback_data: "cancel" }]] }
+      };
     }
     
     const activeGame = await getActiveGame(client);
@@ -506,6 +522,8 @@ export async function handleCallbackQuery(telegramId: string, callbackData: stri
       const transactions = await client.query(`
         SELECT p.name,
           SUM(CASE WHEN t.type IN ('buyin', 'rebuy') THEN t.amount ELSE 0 END) as total_in,
+          COALESCE(SUM(CASE WHEN t.type IN ('buyin', 'rebuy') AND t.payment_method = 'cash' THEN t.amount ELSE 0 END), 0) as player_cash,
+          COALESCE(SUM(CASE WHEN t.type IN ('buyin', 'rebuy') AND t.payment_method = 'zelle' THEN t.amount ELSE 0 END), 0) as player_zelle,
           COUNT(CASE WHEN t.type = 'rebuy' THEN 1 END) as rebuy_count,
           MAX(CASE WHEN t.type = 'cashout' THEN 1 ELSE 0 END) as cashed_out
         FROM poker_transactions t
@@ -529,10 +547,16 @@ export async function handleCallbackQuery(telegramId: string, callbackData: stri
       
       for (const row of transactions.rows) {
         const totalIn = parseFloat(row.total_in) || 0;
+        const playerCash = parseFloat(row.player_cash) || 0;
+        const playerZelle = parseFloat(row.player_zelle) || 0;
         const rebuyCount = parseInt(row.rebuy_count) || 0;
         const status = row.cashed_out ? "✅" : "🎲";
         const rebuyText = rebuyCount > 0 ? ` (+${rebuyCount} rebuy)` : "";
-        message += `${status} ${row.name}: $${totalIn.toFixed(0)}${rebuyText}\n`;
+        const paymentDetails = [];
+        if (playerCash > 0) paymentDetails.push(`💵$${playerCash.toFixed(0)}`);
+        if (playerZelle > 0) paymentDetails.push(`💳$${playerZelle.toFixed(0)}`);
+        const paymentText = paymentDetails.length > 0 ? ` [${paymentDetails.join(" ")}]` : "";
+        message += `${status} ${row.name}: $${totalIn.toFixed(0)}${rebuyText}${paymentText}\n`;
         totalBank += totalIn;
       }
       
