@@ -31,9 +31,11 @@
 | 👥 Игроки | List all players |
 | 🎲 Начать игру | Start new game (admin only) |
 | ➕ Добавить гостя | Add guest player without Telegram (admin only) |
+| 💰 Rebuy гостя | Add rebuy for guest player (admin only) |
 | 🎰 Кэшаут гостя | Cashout guest player (admin only) |
 | 🏁 Завершить игру | End game (admin only) |
-| 🗑️ Обнулить статистику | Reset all stats (admin only, with confirmation) |
+| 🗑️ Обнулить всё | Reset all stats (admin only, with confirmation) |
+| 🗑️ Удалить игру | Delete specific game by number (admin only) |
 
 ### Payment Selection
 After "Join" or "Rebuy":
