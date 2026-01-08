@@ -204,9 +204,15 @@ function getMainMenuKeyboard(isAdmin: boolean, isInGame: boolean, hasActiveGame:
         { text: "➕ Добавить гостя", callback_data: "add_guest" },
         { text: "🏁 Завершить игру", callback_data: "end_game" }
       ]);
-      keyboard.push([{ text: "🎰 Кэшаут гостя", callback_data: "guest_cashout_select" }]);
+      keyboard.push([
+        { text: "💰 Rebuy гостя", callback_data: "guest_rebuy_select" },
+        { text: "🎰 Кэшаут гостя", callback_data: "guest_cashout_select" }
+      ]);
     }
-    keyboard.push([{ text: "🗑️ Обнулить статистику", callback_data: "reset_stats_confirm" }]);
+    keyboard.push([
+      { text: "🗑️ Обнулить всё", callback_data: "reset_stats_confirm" },
+      { text: "🗑️ Удалить игру", callback_data: "delete_game_select" }
+    ]);
   }
   
   keyboard.push([
@@ -308,8 +314,9 @@ export async function handleCommand(telegramId: string, message: string): Promis
         [guestTelegramId]
       );
       
+      await client.query("DELETE FROM poker_pending_actions WHERE telegram_id = $1", [telegramId]);
       await client.query(
-        "INSERT INTO poker_pending_actions (telegram_id, action_type, context) VALUES ($1, $2, $3) ON CONFLICT (telegram_id) DO UPDATE SET action_type = $2, context = $3",
+        "INSERT INTO poker_pending_actions (telegram_id, action_type, context) VALUES ($1, $2, $3)",
         [telegramId, "guest_buyin_payment", JSON.stringify({ guestId: newGuest.rows[0].id, guestName })]
       );
       
@@ -885,6 +892,178 @@ export async function handleCallbackQuery(telegramId: string, callbackData: stri
       return {
         text: `🎰 *КЭШАУТ: ${guestResult.rows[0].name}*\n\nСколько фишек у гостя? (200 = $20)`,
         reply_markup: { inline_keyboard: [[{ text: "❌ Отмена", callback_data: "cancel" }]] }
+      };
+    }
+    
+    if (callbackData === "delete_game_select") {
+      if (!isAdmin) {
+        await client.query('COMMIT');
+        return { text: "⛔ Только админ может удалять игры!" };
+      }
+      
+      const games = await client.query(
+        "SELECT id, status, created_at FROM poker_games ORDER BY id DESC LIMIT 10"
+      );
+      
+      await client.query('COMMIT');
+      
+      if (games.rows.length === 0) {
+        return {
+          text: "📋 Нет игр для удаления.",
+          reply_markup: getMainMenuKeyboard(isAdmin, isInGame && !hasCashedOut, !!activeGame)
+        };
+      }
+      
+      const gameButtons = games.rows.map(g => {
+        const status = g.status === 'active' ? '🟢' : '🔴';
+        return [{ text: `${status} Игра #${g.id}`, callback_data: `delete_game_${g.id}` }];
+      });
+      gameButtons.push([{ text: "❌ Отмена", callback_data: "cancel" }]);
+      
+      return {
+        text: "🗑️ *УДАЛИТЬ ИГРУ*\n\nВыберите игру для удаления:",
+        reply_markup: { inline_keyboard: gameButtons }
+      };
+    }
+    
+    if (callbackData.startsWith("delete_game_")) {
+      const gameId = parseInt(callbackData.replace("delete_game_", ""));
+      
+      if (!isAdmin) {
+        await client.query('COMMIT');
+        return { text: "⛔ Только админ может удалять игры!" };
+      }
+      
+      const gameResult = await client.query("SELECT id, status FROM poker_games WHERE id = $1", [gameId]);
+      if (gameResult.rows.length === 0) {
+        await client.query('COMMIT');
+        return { text: "❌ Игра не найдена." };
+      }
+      
+      if (gameResult.rows[0].status === 'active') {
+        await client.query('COMMIT');
+        return { 
+          text: "⚠️ Нельзя удалить активную игру!\n\nСначала заверши её.",
+          reply_markup: getMainMenuKeyboard(isAdmin, isInGame && !hasCashedOut, !!activeGame)
+        };
+      }
+      
+      await client.query("DELETE FROM poker_transactions WHERE game_id = $1", [gameId]);
+      await client.query("DELETE FROM poker_games WHERE id = $1", [gameId]);
+      
+      await client.query('COMMIT');
+      
+      return {
+        text: `✅ Игра #${gameId} удалена!`,
+        reply_markup: getMainMenuKeyboard(isAdmin, isInGame && !hasCashedOut, !!activeGame)
+      };
+    }
+    
+    if (callbackData === "guest_rebuy_select") {
+      if (!isAdmin) {
+        await client.query('COMMIT');
+        return { text: "⛔ Только админ может делать rebuy для гостей!" };
+      }
+      
+      if (!activeGame) {
+        await client.query('COMMIT');
+        return { text: "⚠️ Нет активной игры!" };
+      }
+      
+      const guests = await client.query(`
+        SELECT DISTINCT p.id, p.name
+        FROM poker_players p
+        JOIN poker_transactions t ON t.player_id = p.id
+        WHERE t.game_id = $1 
+          AND p.telegram_id LIKE 'guest_%'
+          AND NOT EXISTS (
+            SELECT 1 FROM poker_transactions t2 
+            WHERE t2.game_id = $1 AND t2.player_id = p.id AND t2.type = 'cashout'
+          )
+      `, [activeGame.id]);
+      
+      await client.query('COMMIT');
+      
+      if (guests.rows.length === 0) {
+        return {
+          text: "📋 Нет гостей для rebuy.",
+          reply_markup: getMainMenuKeyboard(isAdmin, isInGame && !hasCashedOut, !!activeGame)
+        };
+      }
+      
+      const guestButtons = guests.rows.map(g => [{ text: `👤 ${g.name}`, callback_data: `guest_rebuy_${g.id}` }]);
+      guestButtons.push([{ text: "❌ Отмена", callback_data: "cancel" }]);
+      
+      return {
+        text: "💰 *REBUY ДЛЯ ГОСТЯ*\n\nВыберите гостя:",
+        reply_markup: { inline_keyboard: guestButtons }
+      };
+    }
+    
+    if (callbackData.startsWith("guest_rebuy_")) {
+      const guestId = parseInt(callbackData.replace("guest_rebuy_", ""));
+      
+      if (!isAdmin) {
+        await client.query('COMMIT');
+        return { text: "⛔ Только админ может делать rebuy для гостей!" };
+      }
+      
+      const guestResult = await client.query("SELECT name FROM poker_players WHERE id = $1", [guestId]);
+      if (guestResult.rows.length === 0) {
+        await client.query('COMMIT');
+        return { text: "❌ Гость не найден." };
+      }
+      
+      await client.query("DELETE FROM poker_pending_actions WHERE telegram_id = $1", [telegramId]);
+      await client.query(
+        "INSERT INTO poker_pending_actions (telegram_id, action_type, context) VALUES ($1, $2, $3)",
+        [telegramId, "guest_rebuy_payment", JSON.stringify({ guestId, guestName: guestResult.rows[0].name })]
+      );
+      await client.query('COMMIT');
+      
+      return {
+        text: `💰 *REBUY: ${guestResult.rows[0].name}*\n\nВыберите способ оплаты:`,
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: "💵 Cash", callback_data: "guest_rebuy_pay_cash" },
+              { text: "💳 Zelle", callback_data: "guest_rebuy_pay_zelle" }
+            ],
+            [{ text: "❌ Отмена", callback_data: "cancel" }]
+          ]
+        }
+      };
+    }
+    
+    if (callbackData === "guest_rebuy_pay_cash" || callbackData === "guest_rebuy_pay_zelle") {
+      const pendingResult = await client.query(
+        "SELECT context FROM poker_pending_actions WHERE telegram_id = $1 AND action_type = 'guest_rebuy_payment'",
+        [telegramId]
+      );
+      
+      if (pendingResult.rows.length === 0) {
+        await client.query('COMMIT');
+        return { text: "❌ Ошибка: действие не найдено." };
+      }
+      
+      const context = JSON.parse(pendingResult.rows[0].context);
+      const paymentMethod = callbackData === "guest_rebuy_pay_cash" ? "cash" : "zelle";
+      
+      await clearPendingAction(client, telegramId);
+      
+      await client.query(
+        `INSERT INTO poker_transactions (game_id, player_id, type, amount, payment_method)
+         VALUES ($1, $2, 'rebuy', $3, $4)`,
+        [activeGame!.id, context.guestId, BUYIN_AMOUNT, paymentMethod]
+      );
+      
+      await client.query('COMMIT');
+      
+      const paymentEmoji = paymentMethod === "cash" ? "💵" : "💳";
+      
+      return {
+        text: `✅ *REBUY ДЛЯ ГОСТЯ!*\n\n👤 ${context.guestName}\n💰 Сумма: +$${BUYIN_AMOUNT}\n${paymentEmoji} Оплата: ${paymentMethod === "cash" ? "Cash" : "Zelle"}`,
+        reply_markup: getMainMenuKeyboard(isAdmin, isInGame && !hasCashedOut, !!activeGame)
       };
     }
     
