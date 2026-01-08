@@ -208,6 +208,7 @@ function getMainMenuKeyboard(isAdmin: boolean, isInGame: boolean, hasActiveGame:
         { text: "💰 Rebuy гостя", callback_data: "guest_rebuy_select" },
         { text: "🎰 Кэшаут гостя", callback_data: "guest_cashout_select" }
       ]);
+      keyboard.push([{ text: "✏️ Редактировать игрока", callback_data: "edit_player_select" }]);
     }
     keyboard.push([
       { text: "🗑️ Обнулить всё", callback_data: "reset_stats_confirm" },
@@ -352,6 +353,38 @@ export async function handleCommand(telegramId: string, message: string): Promis
       await client.query('COMMIT');
       const result = await processGuestCashout(guestId, totalChips);
       return result;
+    }
+    
+    if (pendingAction === "edit_player_name") {
+      const contextResult = await client.query(
+        "SELECT context FROM poker_pending_actions WHERE telegram_id = $1 AND action_type = 'edit_player_name'",
+        [telegramId]
+      );
+      
+      if (contextResult.rows.length === 0) {
+        await client.query('COMMIT');
+        return { text: "❌ Ошибка: действие не найдено." };
+      }
+      
+      const context = JSON.parse(contextResult.rows[0].context);
+      const newName = text.trim();
+      
+      if (!newName || newName.startsWith("/")) {
+        await client.query('COMMIT');
+        return {
+          text: "❌ Введите имя (без команд):",
+          reply_markup: { inline_keyboard: [[{ text: "❌ Отмена", callback_data: "cancel" }]] }
+        };
+      }
+      
+      await client.query("UPDATE poker_players SET name = $1 WHERE id = $2", [newName, context.playerId]);
+      await clearPendingAction(client, telegramId);
+      await client.query('COMMIT');
+      
+      return {
+        text: `✅ Имя изменено!\n\n${context.oldName} → ${newName}`,
+        reply_markup: { inline_keyboard: [[{ text: "◀️ Назад к игроку", callback_data: `edit_player_${context.playerId}` }]] }
+      };
     }
     
     if (text === "/start" || text === "/help" || text === "/menu") {
@@ -1066,6 +1099,283 @@ export async function handleCallbackQuery(telegramId: string, callbackData: stri
         reply_markup: getMainMenuKeyboard(isAdmin, isInGame && !hasCashedOut, !!activeGame)
       };
     }
+    
+    // ===== EDIT PLAYER HANDLERS =====
+    if (callbackData === "edit_player_select") {
+      if (!isAdmin) {
+        await client.query('COMMIT');
+        return { text: "⛔ Только админ может редактировать игроков!" };
+      }
+      
+      if (!activeGame) {
+        await client.query('COMMIT');
+        return { text: "❌ Нет активной игры.", reply_markup: getMainMenuKeyboard(isAdmin, false, false) };
+      }
+      
+      const players = await client.query(`
+        SELECT DISTINCT p.id, p.name, p.telegram_id
+        FROM poker_players p
+        JOIN poker_transactions t ON t.player_id = p.id
+        WHERE t.game_id = $1
+        ORDER BY p.name
+      `, [activeGame.id]);
+      
+      await client.query('COMMIT');
+      
+      if (players.rows.length === 0) {
+        return {
+          text: "📋 В игре пока нет игроков.",
+          reply_markup: getMainMenuKeyboard(isAdmin, isInGame && !hasCashedOut, !!activeGame)
+        };
+      }
+      
+      const playerButtons = players.rows.map(p => {
+        const isGuest = p.telegram_id.startsWith("guest_");
+        const icon = isGuest ? "👻" : "👤";
+        return [{ text: `${icon} ${p.name}`, callback_data: `edit_player_${p.id}` }];
+      });
+      playerButtons.push([{ text: "❌ Отмена", callback_data: "cancel" }]);
+      
+      return {
+        text: "✏️ *РЕДАКТИРОВАНИЕ ИГРОКА*\n\nВыберите игрока:",
+        reply_markup: { inline_keyboard: playerButtons }
+      };
+    }
+    
+    if (callbackData.startsWith("edit_player_") && !callbackData.startsWith("edit_player_select") && !callbackData.startsWith("edit_player_name_")) {
+      const playerId = parseInt(callbackData.replace("edit_player_", ""));
+      
+      if (!isAdmin) {
+        await client.query('COMMIT');
+        return { text: "⛔ Только админ может редактировать игроков!" };
+      }
+      
+      const playerResult = await client.query("SELECT * FROM poker_players WHERE id = $1", [playerId]);
+      if (playerResult.rows.length === 0) {
+        await client.query('COMMIT');
+        return { text: "❌ Игрок не найден." };
+      }
+      const editPlayer = playerResult.rows[0];
+      
+      const transactions = await client.query(`
+        SELECT id, type, amount, payment_method, chips_total, created_at
+        FROM poker_transactions
+        WHERE game_id = $1 AND player_id = $2
+        ORDER BY created_at ASC
+      `, [activeGame!.id, playerId]);
+      
+      await client.query('COMMIT');
+      
+      let message = `✏️ *${editPlayer.name}*\n`;
+      message += `━━━━━━━━━━━━━━━━━━━━━\n`;
+      
+      if (transactions.rows.length === 0) {
+        message += "Нет транзакций в текущей игре.\n";
+      } else {
+        transactions.rows.forEach((t, idx) => {
+          const typeEmoji = t.type === 'buyin' ? '🎮' : t.type === 'rebuy' ? '💰' : '🎰';
+          const paymentEmoji = t.payment_method === 'cash' ? '💵' : t.payment_method === 'zelle' ? '💳' : '';
+          message += `${idx + 1}. ${typeEmoji} ${t.type.toUpperCase()} $${parseFloat(t.amount).toFixed(0)} ${paymentEmoji}\n`;
+        });
+      }
+      
+      const transButtons = transactions.rows.map((t, idx) => {
+        const typeLabel = t.type === 'buyin' ? 'Buy-in' : t.type === 'rebuy' ? 'Rebuy' : 'Cashout';
+        return [{ text: `✏️ ${idx + 1}. ${typeLabel} $${parseFloat(t.amount).toFixed(0)}`, callback_data: `edit_trans_${t.id}` }];
+      });
+      
+      transButtons.push([{ text: "📝 Изменить имя", callback_data: `edit_player_name_${playerId}` }]);
+      transButtons.push([{ text: "◀️ Назад", callback_data: "edit_player_select" }]);
+      
+      return {
+        text: message,
+        reply_markup: { inline_keyboard: transButtons }
+      };
+    }
+    
+    if (callbackData.startsWith("edit_player_name_")) {
+      const playerId = parseInt(callbackData.replace("edit_player_name_", ""));
+      
+      if (!isAdmin) {
+        await client.query('COMMIT');
+        return { text: "⛔ Только админ может редактировать игроков!" };
+      }
+      
+      const playerResult = await client.query("SELECT name FROM poker_players WHERE id = $1", [playerId]);
+      if (playerResult.rows.length === 0) {
+        await client.query('COMMIT');
+        return { text: "❌ Игрок не найден." };
+      }
+      
+      await client.query("DELETE FROM poker_pending_actions WHERE telegram_id = $1", [telegramId]);
+      await client.query(
+        "INSERT INTO poker_pending_actions (telegram_id, action_type, context) VALUES ($1, $2, $3)",
+        [telegramId, "edit_player_name", JSON.stringify({ playerId, oldName: playerResult.rows[0].name })]
+      );
+      await client.query('COMMIT');
+      
+      return {
+        text: `📝 *ИЗМЕНЕНИЕ ИМЕНИ*\n\nТекущее имя: ${playerResult.rows[0].name}\n\nВведите новое имя:`
+      };
+    }
+    
+    if (callbackData.startsWith("edit_trans_")) {
+      const transId = parseInt(callbackData.replace("edit_trans_", ""));
+      
+      if (!isAdmin) {
+        await client.query('COMMIT');
+        return { text: "⛔ Только админ может редактировать транзакции!" };
+      }
+      
+      const transResult = await client.query(`
+        SELECT t.*, p.name as player_name
+        FROM poker_transactions t
+        JOIN poker_players p ON p.id = t.player_id
+        WHERE t.id = $1
+      `, [transId]);
+      
+      if (transResult.rows.length === 0) {
+        await client.query('COMMIT');
+        return { text: "❌ Транзакция не найдена." };
+      }
+      
+      const trans = transResult.rows[0];
+      await client.query('COMMIT');
+      
+      const typeEmoji = trans.type === 'buyin' ? '🎮' : trans.type === 'rebuy' ? '💰' : '🎰';
+      const paymentEmoji = trans.payment_method === 'cash' ? '💵' : trans.payment_method === 'zelle' ? '💳' : '';
+      
+      let message = `✏️ *РЕДАКТИРОВАНИЕ ТРАНЗАКЦИИ*\n\n`;
+      message += `👤 Игрок: ${trans.player_name}\n`;
+      message += `${typeEmoji} Тип: ${trans.type.toUpperCase()}\n`;
+      message += `💰 Сумма: $${parseFloat(trans.amount).toFixed(0)}\n`;
+      if (trans.payment_method) {
+        message += `${paymentEmoji} Оплата: ${trans.payment_method === 'cash' ? 'Cash' : 'Zelle'}\n`;
+      }
+      if (trans.type === 'cashout' && trans.chips_total) {
+        message += `🎲 Фишек: ${trans.chips_total}\n`;
+      }
+      
+      const buttons: Array<Array<{ text: string; callback_data: string }>> = [];
+      
+      // Only show payment switch for buy-in/rebuy with payment method
+      if ((trans.type === 'buyin' || trans.type === 'rebuy') && trans.payment_method) {
+        const newMethod = trans.payment_method === 'cash' ? 'zelle' : 'cash';
+        const newMethodLabel = newMethod === 'cash' ? '💵 Cash' : '💳 Zelle';
+        buttons.push([{ text: `🔄 Сменить на ${newMethodLabel}`, callback_data: `change_payment_${transId}_${newMethod}` }]);
+      }
+      
+      // Delete transaction (not for cashouts in active game - would mess up results)
+      if (trans.type !== 'cashout') {
+        buttons.push([{ text: "🗑️ Удалить транзакцию", callback_data: `delete_trans_confirm_${transId}` }]);
+      } else {
+        buttons.push([{ text: "🗑️ Отменить кэшаут", callback_data: `delete_trans_confirm_${transId}` }]);
+      }
+      
+      buttons.push([{ text: "◀️ Назад", callback_data: `edit_player_${trans.player_id}` }]);
+      
+      return {
+        text: message,
+        reply_markup: { inline_keyboard: buttons }
+      };
+    }
+    
+    if (callbackData.startsWith("change_payment_")) {
+      const parts = callbackData.replace("change_payment_", "").split("_");
+      const transId = parseInt(parts[0]);
+      const newMethod = parts[1];
+      
+      if (!isAdmin) {
+        await client.query('COMMIT');
+        return { text: "⛔ Только админ может изменять транзакции!" };
+      }
+      
+      const transResult = await client.query(`
+        SELECT t.player_id, p.name as player_name
+        FROM poker_transactions t
+        JOIN poker_players p ON p.id = t.player_id
+        WHERE t.id = $1
+      `, [transId]);
+      
+      if (transResult.rows.length === 0) {
+        await client.query('COMMIT');
+        return { text: "❌ Транзакция не найдена." };
+      }
+      
+      await client.query("UPDATE poker_transactions SET payment_method = $1 WHERE id = $2", [newMethod, transId]);
+      await client.query('COMMIT');
+      
+      const paymentEmoji = newMethod === 'cash' ? '💵' : '💳';
+      const paymentLabel = newMethod === 'cash' ? 'Cash' : 'Zelle';
+      
+      return {
+        text: `✅ Способ оплаты изменён на ${paymentEmoji} ${paymentLabel}`,
+        reply_markup: { inline_keyboard: [[{ text: "◀️ Назад к игроку", callback_data: `edit_player_${transResult.rows[0].player_id}` }]] }
+      };
+    }
+    
+    if (callbackData.startsWith("delete_trans_confirm_")) {
+      const transId = parseInt(callbackData.replace("delete_trans_confirm_", ""));
+      
+      if (!isAdmin) {
+        await client.query('COMMIT');
+        return { text: "⛔ Только админ может удалять транзакции!" };
+      }
+      
+      const transResult = await client.query(`
+        SELECT t.*, p.name as player_name
+        FROM poker_transactions t
+        JOIN poker_players p ON p.id = t.player_id
+        WHERE t.id = $1
+      `, [transId]);
+      
+      if (transResult.rows.length === 0) {
+        await client.query('COMMIT');
+        return { text: "❌ Транзакция не найдена." };
+      }
+      
+      const trans = transResult.rows[0];
+      await client.query('COMMIT');
+      
+      const typeLabel = trans.type === 'buyin' ? 'Buy-in' : trans.type === 'rebuy' ? 'Rebuy' : 'Cashout';
+      
+      return {
+        text: `⚠️ *УДАЛЕНИЕ ТРАНЗАКЦИИ*\n\n👤 ${trans.player_name}\n🎯 ${typeLabel} $${parseFloat(trans.amount).toFixed(0)}\n\nУдалить эту транзакцию?`,
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: "✅ Да, удалить", callback_data: `delete_trans_yes_${transId}` },
+              { text: "❌ Отмена", callback_data: `edit_player_${trans.player_id}` }
+            ]
+          ]
+        }
+      };
+    }
+    
+    if (callbackData.startsWith("delete_trans_yes_")) {
+      const transId = parseInt(callbackData.replace("delete_trans_yes_", ""));
+      
+      if (!isAdmin) {
+        await client.query('COMMIT');
+        return { text: "⛔ Только админ может удалять транзакции!" };
+      }
+      
+      const transResult = await client.query("SELECT player_id FROM poker_transactions WHERE id = $1", [transId]);
+      if (transResult.rows.length === 0) {
+        await client.query('COMMIT');
+        return { text: "❌ Транзакция не найдена." };
+      }
+      
+      const playerId = transResult.rows[0].player_id;
+      await client.query("DELETE FROM poker_transactions WHERE id = $1", [transId]);
+      await client.query('COMMIT');
+      
+      return {
+        text: "✅ Транзакция удалена!",
+        reply_markup: { inline_keyboard: [[{ text: "◀️ Назад к игроку", callback_data: `edit_player_${playerId}` }]] }
+      };
+    }
+    // ===== END EDIT PLAYER HANDLERS =====
     
     if (callbackData === "reset_stats_confirm") {
       if (!isAdmin) {
