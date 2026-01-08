@@ -34,6 +34,7 @@
 | 💰 Rebuy гостя | Add rebuy for guest player (admin only) |
 | 🎰 Кэшаут гостя | Cashout guest player (admin only) |
 | 🏁 Завершить игру | End game (admin only) |
+| ✏️ Редактировать игрока | Edit player transactions/name (admin only) |
 | 🗑️ Обнулить всё | Reset all stats (admin only, with confirmation) |
 | 🗑️ Удалить игру | Delete specific game by number (admin only) |
 

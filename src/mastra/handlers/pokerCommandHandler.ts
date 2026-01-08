@@ -208,8 +208,8 @@ function getMainMenuKeyboard(isAdmin: boolean, isInGame: boolean, hasActiveGame:
         { text: "💰 Rebuy гостя", callback_data: "guest_rebuy_select" },
         { text: "🎰 Кэшаут гостя", callback_data: "guest_cashout_select" }
       ]);
-      keyboard.push([{ text: "✏️ Редактировать игрока", callback_data: "edit_player_select" }]);
     }
+    keyboard.push([{ text: "✏️ Редактировать игрока", callback_data: "edit_player_select" }]);
     keyboard.push([
       { text: "🗑️ Обнулить всё", callback_data: "reset_stats_confirm" },
       { text: "🗑️ Удалить игру", callback_data: "delete_game_select" }
@@ -1107,37 +1107,45 @@ export async function handleCallbackQuery(telegramId: string, callbackData: stri
         return { text: "⛔ Только админ может редактировать игроков!" };
       }
       
-      if (!activeGame) {
-        await client.query('COMMIT');
-        return { text: "❌ Нет активной игры.", reply_markup: getMainMenuKeyboard(isAdmin, false, false) };
+      // If active game, show players in game; otherwise show all registered players
+      let players;
+      let headerText;
+      if (activeGame) {
+        players = await client.query(`
+          SELECT DISTINCT p.id, p.name, p.telegram_id
+          FROM poker_players p
+          JOIN poker_transactions t ON t.player_id = p.id
+          WHERE t.game_id = $1
+          ORDER BY p.name
+        `, [activeGame.id]);
+        headerText = "✏️ *РЕДАКТИРОВАНИЕ ИГРОКА*\n\nВыберите игрока в текущей игре:";
+      } else {
+        players = await client.query(`
+          SELECT id, name, telegram_id
+          FROM poker_players
+          ORDER BY name
+        `);
+        headerText = "✏️ *РЕДАКТИРОВАНИЕ ИГРОКА*\n\nВыберите игрока:";
       }
-      
-      const players = await client.query(`
-        SELECT DISTINCT p.id, p.name, p.telegram_id
-        FROM poker_players p
-        JOIN poker_transactions t ON t.player_id = p.id
-        WHERE t.game_id = $1
-        ORDER BY p.name
-      `, [activeGame.id]);
       
       await client.query('COMMIT');
       
       if (players.rows.length === 0) {
         return {
-          text: "📋 В игре пока нет игроков.",
+          text: activeGame ? "📋 В игре пока нет игроков." : "📋 Нет зарегистрированных игроков.",
           reply_markup: getMainMenuKeyboard(isAdmin, isInGame && !hasCashedOut, !!activeGame)
         };
       }
       
       const playerButtons = players.rows.map(p => {
-        const isGuest = p.telegram_id.startsWith("guest_");
-        const icon = isGuest ? "👻" : "👤";
+        const isGuestPlayer = p.telegram_id.startsWith("guest_");
+        const icon = isGuestPlayer ? "👻" : "👤";
         return [{ text: `${icon} ${p.name}`, callback_data: `edit_player_${p.id}` }];
       });
       playerButtons.push([{ text: "❌ Отмена", callback_data: "cancel" }]);
       
       return {
-        text: "✏️ *РЕДАКТИРОВАНИЕ ИГРОКА*\n\nВыберите игрока:",
+        text: headerText,
         reply_markup: { inline_keyboard: playerButtons }
       };
     }
@@ -1157,19 +1165,24 @@ export async function handleCallbackQuery(telegramId: string, callbackData: stri
       }
       const editPlayer = playerResult.rows[0];
       
-      const transactions = await client.query(`
-        SELECT id, type, amount, payment_method, chips_total, created_at
-        FROM poker_transactions
-        WHERE game_id = $1 AND player_id = $2
-        ORDER BY created_at ASC
-      `, [activeGame!.id, playerId]);
+      let transactions = { rows: [] as any[] };
+      if (activeGame) {
+        transactions = await client.query(`
+          SELECT id, type, amount, payment_method, chips_total, created_at
+          FROM poker_transactions
+          WHERE game_id = $1 AND player_id = $2
+          ORDER BY created_at ASC
+        `, [activeGame.id, playerId]);
+      }
       
       await client.query('COMMIT');
       
       let message = `✏️ *${editPlayer.name}*\n`;
       message += `━━━━━━━━━━━━━━━━━━━━━\n`;
       
-      if (transactions.rows.length === 0) {
+      if (!activeGame) {
+        message += "Нет активной игры.\n";
+      } else if (transactions.rows.length === 0) {
         message += "Нет транзакций в текущей игре.\n";
       } else {
         transactions.rows.forEach((t, idx) => {
@@ -1179,7 +1192,7 @@ export async function handleCallbackQuery(telegramId: string, callbackData: stri
         });
       }
       
-      const transButtons = transactions.rows.map((t, idx) => {
+      const transButtons: Array<Array<{ text: string; callback_data: string }>> = transactions.rows.map((t, idx) => {
         const typeLabel = t.type === 'buyin' ? 'Buy-in' : t.type === 'rebuy' ? 'Rebuy' : 'Cashout';
         return [{ text: `✏️ ${idx + 1}. ${typeLabel} $${parseFloat(t.amount).toFixed(0)}`, callback_data: `edit_trans_${t.id}` }];
       });
