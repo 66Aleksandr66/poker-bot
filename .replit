@@ -6,7 +6,7 @@ automationTriggerConnectorName = "legacy_telegram"
 
 [nix]
 channel = "stable-24_11"
-packages = ["jq"]
+packages = ["jq", "zip"]
 
 [env]
 MASTRA_HIDE_CLOUD_CTA = "true"
